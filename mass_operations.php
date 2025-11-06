@@ -1,0 +1,942 @@
+<?php
+/**
+ * Упрощенные массовые операции Cloudflare
+ */
+
+// Подавляем вывод ошибок и предупреждений для чистого JSON ответа
+error_reporting(0);
+ini_set('display_errors', 0);
+
+require_once 'config.php';
+require_once 'functions.php';
+
+// Проверяем авторизацию
+if (!isset($_SESSION['user_id'])) {
+    header('Location: login.php');
+    exit;
+}
+
+$userId = $_SESSION['user_id'];
+
+// Получаем домены пользователя
+$stmt = $pdo->prepare("
+    SELECT ca.id, ca.domain, ca.zone_id, ca.dns_ip, ca.ssl_mode, ca.always_use_https, 
+           ca.min_tls_version, g.name as group_name, cc.email
+    FROM cloudflare_accounts ca
+    JOIN cloudflare_credentials cc ON ca.account_id = cc.id
+    LEFT JOIN groups g ON ca.group_id = g.id
+    WHERE ca.user_id = ?
+    ORDER BY ca.domain ASC
+");
+$stmt->execute([$userId]);
+$domains = $stmt->fetchAll();
+
+// Обработка массовых операций
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+    // Подавляем любые дополнительные ошибки для POST запросов
+    error_reporting(0);
+    ini_set('display_errors', 0);
+    
+    header('Content-Type: application/json');
+    
+    $selectedDomains = $_POST['domain_ids'] ?? [];
+    if (empty($selectedDomains)) {
+        echo json_encode(['success' => false, 'error' => 'Не выбраны домены']);
+        exit;
+    }
+    
+    // Декодируем JSON если нужно
+    if (is_string($selectedDomains)) {
+        $selectedDomains = json_decode($selectedDomains, true);
+    }
+    
+    $results = [];
+    $success = 0;
+    $errors = 0;
+    
+    foreach ($selectedDomains as $domainId) {
+        try {
+            $result = performOperation($_POST['action'], $domainId, $_POST);
+            $results[] = $result;
+            if ($result['success']) {
+                $success++;
+            } else {
+                $errors++;
+            }
+        } catch (Exception $e) {
+            $results[] = ['success' => false, 'error' => $e->getMessage(), 'domain_id' => $domainId];
+            $errors++;
+        }
+        
+        // Задержка между операциями
+        usleep(500000); // 0.5 секунды
+    }
+    
+    echo json_encode([
+        'success' => true,
+        'processed' => count($selectedDomains),
+        'success_count' => $success,
+        'error_count' => $errors,
+        'results' => $results
+    ]);
+    exit;
+}
+
+function performOperation($action, $domainId, $params) {
+    global $pdo, $userId;
+    
+    // Получаем информацию о домене
+    $stmt = $pdo->prepare("
+        SELECT ca.*, cc.email, cc.api_key
+        FROM cloudflare_accounts ca
+        JOIN cloudflare_credentials cc ON ca.account_id = cc.id
+        WHERE ca.id = ? AND ca.user_id = ?
+    ");
+    $stmt->execute([$domainId, $userId]);
+    $domain = $stmt->fetch();
+    
+    if (!$domain) {
+        return ['success' => false, 'error' => 'Домен не найден', 'domain_id' => $domainId];
+    }
+    
+    // ДОБАВЛЕНО: Логирование параметров для отладки
+    logAction($pdo, $userId, "Mass Operation Request", "Action: $action, Domain: {$domain['domain']}, Params: " . json_encode($params));
+    
+    switch ($action) {
+        case 'change_ip':
+            return changeIP($domain, $params['new_ip'] ?? '');
+            
+        case 'change_ssl_mode':
+            return changeSSLMode($domain, $params['ssl_mode'] ?? '');
+            
+        case 'change_https':
+            return changeHTTPS($domain, $params['always_use_https'] ?? '');
+            
+        case 'change_tls':
+            return changeTLS($domain, $params['min_tls_version'] ?? '');
+            
+        case 'delete_domain':
+            return deleteDomainFromMass($domain);
+            
+        default:
+            return ['success' => false, 'error' => 'Неизвестная операция', 'domain_id' => $domainId];
+    }
+}
+
+function changeIP($domain, $newIP) {
+    global $pdo, $userId;
+    
+    if (!$domain['zone_id']) {
+        return ['success' => false, 'error' => 'Zone ID не найден', 'domain_id' => $domain['id']];
+    }
+    
+    // ИСПРАВЛЕНО: Валидация IP адреса
+    if (empty($newIP) || !filter_var($newIP, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        return ['success' => false, 'error' => "Некорректный IPv4 адрес: '$newIP'", 'domain_id' => $domain['id']];
+    }
+    
+    try {
+        // Получаем прокси для API запроса
+        $proxies = getProxies($pdo, $userId);
+        
+        logAction($pdo, $userId, "Mass IP Change Attempt", "Domain: {$domain['domain']}, New IP: '$newIP'");
+        
+        // Получаем все A-записи для домена
+        $dnsResponse = cloudflareApiRequest(
+            $pdo, 
+            $domain['email'], 
+            $domain['api_key'], 
+            "zones/{$domain['zone_id']}/dns_records?type=A",
+            'GET', 
+            [], 
+            $proxies, 
+            $userId
+        );
+        
+        if (!$dnsResponse || empty($dnsResponse->result)) {
+            logAction($pdo, $userId, "Mass IP Change Failed", "Domain: {$domain['domain']}, Error: A-записи не найдены");
+            return ['success' => false, 'error' => 'A-записи не найдены', 'domain_id' => $domain['id']];
+        }
+        
+        $updatedCount = 0;
+        $errorCount = 0;
+        
+        // Обновляем все A-записи на новый IP
+        foreach ($dnsResponse->result as $record) {
+            if ($record->type === 'A' && $record->content !== $newIP) {
+                $updateResult = cloudflareApiRequest(
+                    $pdo,
+                    $domain['email'],
+                    $domain['api_key'],
+                    "zones/{$domain['zone_id']}/dns_records/{$record->id}",
+                    'PATCH',
+                    [
+                        'content' => $newIP,
+                        'name' => $record->name,
+                        'type' => 'A',
+                        'ttl' => $record->ttl ?? 1,
+                        'proxied' => $record->proxied ?? false
+                    ],
+                    $proxies,
+                    $userId
+                );
+                
+                if ($updateResult && isset($updateResult->success) && $updateResult->success) {
+                    $updatedCount++;
+                } else {
+                    $errorCount++;
+                    logAction($pdo, $userId, "Mass IP Change Record Failed", "Domain: {$domain['domain']}, Record: {$record->name}, Error: API returned false");
+                }
+            }
+        }
+        
+        if ($updatedCount > 0) {
+            // Обновляем IP в базе данных
+            $stmt = $pdo->prepare("UPDATE cloudflare_accounts SET dns_ip = ? WHERE id = ?");
+            $stmt->execute([$newIP, $domain['id']]);
+            
+            // Логируем операцию
+            logAction($pdo, $userId, "Mass IP Change Success", "Domain: {$domain['domain']}, New IP: $newIP, Records Updated: $updatedCount, Errors: $errorCount");
+            
+            return [
+                'success' => true,
+                'message' => "IP изменен на $newIP ($updatedCount записей обновлено" . ($errorCount > 0 ? ", $errorCount ошибок" : "") . ")",
+                'domain_id' => $domain['id'],
+                'new_ip' => $newIP,
+                'records_updated' => $updatedCount,
+                'errors' => $errorCount
+            ];
+        } else {
+            logAction($pdo, $userId, "Mass IP Change Failed", "Domain: {$domain['domain']}, Error: Не удалось обновить ни одну DNS запись");
+            return ['success' => false, 'error' => 'Не удалось обновить DNS записи', 'domain_id' => $domain['id']];
+        }
+        
+    } catch (Exception $e) {
+        logAction($pdo, $userId, "Mass IP Change Exception", "Domain: {$domain['domain']}, Error: " . $e->getMessage());
+        return ['success' => false, 'error' => 'Ошибка API: ' . $e->getMessage(), 'domain_id' => $domain['id']];
+    }
+}
+
+function changeSSLMode($domain, $sslMode) {
+    global $pdo, $userId;
+    
+    if (!$domain['zone_id']) {
+        return ['success' => false, 'error' => 'Zone ID не найден', 'domain_id' => $domain['id']];
+    }
+    
+    try {
+        $proxies = getProxies($pdo, $userId);
+        
+        // ИСПРАВЛЕНО: Валидация SSL режима
+        $validSslModes = ['off', 'flexible', 'full', 'strict'];
+        if (!in_array($sslMode, $validSslModes)) {
+            return ['success' => false, 'error' => "Недопустимый SSL режим: $sslMode", 'domain_id' => $domain['id']];
+        }
+        
+        logAction($pdo, $userId, "Mass SSL Mode Change Attempt", "Domain: {$domain['domain']}, SSL Mode: '$sslMode'");
+        
+        // Обновляем SSL режим через Cloudflare API
+        $result = cloudflareApiRequest(
+            $pdo,
+            $domain['email'],
+            $domain['api_key'],
+            "zones/{$domain['zone_id']}/settings/ssl",
+            'PATCH',
+            ['value' => $sslMode],
+            $proxies,
+            $userId
+        );
+        
+        if ($result && isset($result->success) && $result->success) {
+            // Обновляем в базе данных
+            $stmt = $pdo->prepare("UPDATE cloudflare_accounts SET ssl_mode = ? WHERE id = ?");
+            $stmt->execute([$sslMode, $domain['id']]);
+            
+            logAction($pdo, $userId, "Mass SSL Mode Change Success", "Domain: {$domain['domain']}, New SSL Mode: $sslMode");
+            
+            return [
+                'success' => true,
+                'message' => "SSL режим изменен на $sslMode",
+                'domain_id' => $domain['id'],
+                'ssl_mode' => $sslMode
+            ];
+        } else {
+            $errorMsg = 'Не удалось изменить SSL режим через API';
+            if (isset($result->errors) && is_array($result->errors)) {
+                $errors = array_map(function($err) { return $err->message ?? 'Unknown error'; }, $result->errors);
+                $errorMsg .= ': ' . implode(', ', $errors);
+            }
+            
+            logAction($pdo, $userId, "Mass SSL Mode Change Failed", "Domain: {$domain['domain']}, Error: $errorMsg");
+            return ['success' => false, 'error' => $errorMsg, 'domain_id' => $domain['id']];
+        }
+        
+    } catch (Exception $e) {
+        logAction($pdo, $userId, "Mass SSL Mode Change Exception", "Domain: {$domain['domain']}, Error: " . $e->getMessage());
+        return ['success' => false, 'error' => 'Ошибка API: ' . $e->getMessage(), 'domain_id' => $domain['id']];
+    }
+}
+
+function changeHTTPS($domain, $alwaysUseHttps) {
+    global $pdo, $userId;
+    
+    if (!$domain['zone_id']) {
+        return ['success' => false, 'error' => 'Zone ID не найден', 'domain_id' => $domain['id']];
+    }
+    
+    try {
+        $proxies = getProxies($pdo, $userId);
+        
+        // ИСПРАВЛЕНО: Правильная обработка строковых значений
+        // Преобразуем строковые значения в boolean, а затем в формат API
+        $alwaysUseHttpsBool = ($alwaysUseHttps === '1' || $alwaysUseHttps === 1 || $alwaysUseHttps === true);
+        $value = $alwaysUseHttpsBool ? 'on' : 'off';
+        
+        logAction($pdo, $userId, "Mass HTTPS Change Attempt", "Domain: {$domain['domain']}, Input: '$alwaysUseHttps', Bool: " . ($alwaysUseHttpsBool ? 'true' : 'false') . ", API Value: '$value'");
+        
+        // Обновляем Always Use HTTPS через Cloudflare API
+        $result = cloudflareApiRequest(
+            $pdo,
+            $domain['email'],
+            $domain['api_key'],
+            "zones/{$domain['zone_id']}/settings/always_use_https",
+            'PATCH',
+            ['value' => $value],
+            $proxies,
+            $userId
+        );
+        
+        if ($result && isset($result->success) && $result->success) {
+            // Обновляем в базе данных с правильным boolean значением
+            $stmt = $pdo->prepare("UPDATE cloudflare_accounts SET always_use_https = ? WHERE id = ?");
+            $stmt->execute([$alwaysUseHttpsBool ? 1 : 0, $domain['id']]);
+            
+            logAction($pdo, $userId, "Mass HTTPS Change Success", "Domain: {$domain['domain']}, Always Use HTTPS: $value");
+            
+            return [
+                'success' => true,
+                'message' => "Always Use HTTPS " . ($alwaysUseHttpsBool ? 'включен' : 'выключен'),
+                'domain_id' => $domain['id'],
+                'always_use_https' => $alwaysUseHttpsBool
+            ];
+        } else {
+            $errorMsg = 'Не удалось изменить настройку HTTPS через API';
+            if (isset($result->errors) && is_array($result->errors)) {
+                $errors = array_map(function($err) { return $err->message ?? 'Unknown error'; }, $result->errors);
+                $errorMsg .= ': ' . implode(', ', $errors);
+            }
+            
+            logAction($pdo, $userId, "Mass HTTPS Change Failed", "Domain: {$domain['domain']}, Error: $errorMsg");
+            return ['success' => false, 'error' => $errorMsg, 'domain_id' => $domain['id']];
+        }
+        
+    } catch (Exception $e) {
+        logAction($pdo, $userId, "Mass HTTPS Change Exception", "Domain: {$domain['domain']}, Error: " . $e->getMessage());
+        return ['success' => false, 'error' => 'Ошибка API: ' . $e->getMessage(), 'domain_id' => $domain['id']];
+    }
+}
+
+function changeTLS($domain, $minTlsVersion) {
+    global $pdo, $userId;
+    
+    if (!$domain['zone_id']) {
+        return ['success' => false, 'error' => 'Zone ID не найден', 'domain_id' => $domain['id']];
+    }
+    
+    try {
+        $proxies = getProxies($pdo, $userId);
+        
+        // ИСПРАВЛЕНО: Валидация TLS версии
+        $validTlsVersions = ['1.0', '1.1', '1.2', '1.3'];
+        if (!in_array($minTlsVersion, $validTlsVersions)) {
+            return ['success' => false, 'error' => "Недопустимая версия TLS: $minTlsVersion", 'domain_id' => $domain['id']];
+        }
+        
+        logAction($pdo, $userId, "Mass TLS Change Attempt", "Domain: {$domain['domain']}, TLS Version: '$minTlsVersion'");
+        
+        // Обновляем минимальную версию TLS через Cloudflare API
+        $result = cloudflareApiRequest(
+            $pdo,
+            $domain['email'],
+            $domain['api_key'],
+            "zones/{$domain['zone_id']}/settings/min_tls_version",
+            'PATCH',
+            ['value' => $minTlsVersion],
+            $proxies,
+            $userId
+        );
+        
+        if ($result && isset($result->success) && $result->success) {
+            // Обновляем в базе данных
+            $stmt = $pdo->prepare("UPDATE cloudflare_accounts SET min_tls_version = ? WHERE id = ?");
+            $stmt->execute([$minTlsVersion, $domain['id']]);
+            
+            logAction($pdo, $userId, "Mass TLS Change Success", "Domain: {$domain['domain']}, Min TLS Version: $minTlsVersion");
+            
+            return [
+                'success' => true,
+                'message' => "Минимальная версия TLS изменена на $minTlsVersion",
+                'domain_id' => $domain['id'],
+                'min_tls_version' => $minTlsVersion
+            ];
+        } else {
+            $errorMsg = 'Не удалось изменить версию TLS через API';
+            if (isset($result->errors) && is_array($result->errors)) {
+                $errors = array_map(function($err) { return $err->message ?? 'Unknown error'; }, $result->errors);
+                $errorMsg .= ': ' . implode(', ', $errors);
+            }
+            
+            logAction($pdo, $userId, "Mass TLS Change Failed", "Domain: {$domain['domain']}, Error: $errorMsg");
+            return ['success' => false, 'error' => $errorMsg, 'domain_id' => $domain['id']];
+        }
+        
+    } catch (Exception $e) {
+        logAction($pdo, $userId, "Mass TLS Change Exception", "Domain: {$domain['domain']}, Error: " . $e->getMessage());
+        return ['success' => false, 'error' => 'Ошибка API: ' . $e->getMessage(), 'domain_id' => $domain['id']];
+    }
+}
+
+function deleteDomainFromMass($domain) {
+    global $pdo, $userId;
+    
+    try {
+        // Начинаем транзакцию для безопасного удаления
+        $pdo->beginTransaction();
+        
+        // Удаляем домен
+        $deleteStmt = $pdo->prepare("DELETE FROM cloudflare_accounts WHERE id = ? AND user_id = ?");
+        $deleteResult = $deleteStmt->execute([$domain['id'], $userId]);
+        
+        if (!$deleteResult || $deleteStmt->rowCount() === 0) {
+            throw new Exception('Не удалось удалить домен из базы данных');
+        }
+        
+        // Логируем операцию
+        logAction($pdo, $userId, "Mass Delete Domain", "Domain deleted: {$domain['domain']} (Email: {$domain['email']})");
+        
+        // Подтверждаем транзакцию
+        $pdo->commit();
+        
+        return [
+            'success' => true,
+            'message' => "Домен {$domain['domain']} удален",
+            'domain_id' => $domain['id'],
+            'domain' => $domain['domain']
+        ];
+        
+    } catch (Exception $e) {
+        // Откатываем транзакцию при ошибке
+        $pdo->rollBack();
+        return ['success' => false, 'error' => 'Ошибка при удалении: ' . $e->getMessage(), 'domain_id' => $domain['id']];
+    }
+}
+?>
+
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Массовые операции Cloudflare</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        .operation-card {
+            transition: all 0.3s ease;
+            border: 2px solid transparent;
+        }
+        .operation-card:hover {
+            border-color: #007bff;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,123,255,0.15);
+        }
+        .log-container {
+            background: #1a1a1a;
+            color: #e0e0e0;
+            border-radius: 8px;
+            padding: 1rem;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .log-success { color: #4CAF50; }
+        .log-error { color: #f44336; }
+        .log-info { color: #2196F3; }
+        
+        @keyframes fadeOut {
+            from { opacity: 1; }
+            to { opacity: 0; }
+        }
+    </style>
+</head>
+<body class="bg-light">
+    <div class="container-fluid py-4">
+        <!-- Заголовок -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="d-flex justify-content-between align-items-center">
+                    <h1><i class="fas fa-cogs text-primary me-2"></i>Массовые операции Cloudflare</h1>
+                    <a href="dashboard.php" class="btn btn-secondary">
+                        <i class="fas fa-arrow-left me-1"></i>Назад к панели
+                    </a>
+                </div>
+            </div>
+        </div>
+
+        <!-- Статистика -->
+        <div class="row mb-4">
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-body">
+                        <h5 class="card-title"><i class="fas fa-chart-bar me-2"></i>Статистика</h5>
+                        <p class="card-text">
+                            <strong>Всего доменов:</strong> <?php echo count($domains); ?><br>
+                            <strong>С Zone ID:</strong> <?php echo count(array_filter($domains, fn($d) => !empty($d['zone_id']))); ?><br>
+                            <strong>С SSL:</strong> <?php echo count(array_filter($domains, fn($d) => $d['ssl_mode'] !== 'off')); ?>
+                        </p>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-body">
+                        <h5 class="card-title"><i class="fas fa-info-circle me-2"></i>Информация</h5>
+                        <p class="card-text">
+                            Выберите домены и операцию для массового выполнения.<br>
+                            Операции выполняются последовательно с задержкой 0.5 секунды.
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row">
+            <!-- Выбор доменов -->
+            <div class="col-md-4">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0"><i class="fas fa-list me-2"></i>Выбор доменов</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="mb-3">
+                            <label class="form-check-label">
+                                <input type="checkbox" id="selectAll" class="form-check-input me-2" onchange="toggleSelectAll()">
+                                Выбрать все домены
+                            </label>
+                        </div>
+                        
+                        <div style="max-height: 400px; overflow-y: auto;">
+                            <?php foreach ($domains as $domain): ?>
+                                <div class="form-check mb-2">
+                                    <input class="form-check-input domain-checkbox" type="checkbox" 
+                                           value="<?php echo $domain['id']; ?>" id="domain-<?php echo $domain['id']; ?>">
+                                    <label class="form-check-label" for="domain-<?php echo $domain['id']; ?>">
+                                        <strong><?php echo htmlspecialchars($domain['domain']); ?></strong><br>
+                                        <small class="text-muted">
+                                            <?php echo htmlspecialchars($domain['group_name'] ?? 'Без группы'); ?>
+                                            • IP: <?php echo htmlspecialchars($domain['dns_ip'] ?? 'Не указан'); ?>
+                                        </small>
+                                    </label>
+                                </div>
+                            <?php endforeach; ?>
+                        </div>
+                        
+                        <div class="mt-3">
+                            <small class="text-muted">Выбрано: <span id="selectedCount">0</span> доменов</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Операции -->
+            <div class="col-md-8">
+                <!-- Смена IP -->
+                <div class="card operation-card mb-3">
+                    <div class="card-header bg-info text-white">
+                        <h5 class="mb-0"><i class="fas fa-network-wired me-2"></i>Смена IP адресов</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <input type="text" id="newIP" class="form-control" placeholder="Новый IP адрес" 
+                                       pattern="^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$">
+                            </div>
+                            <div class="col-md-6">
+                                <button class="btn btn-info w-100" onclick="changeIP()">
+                                    <i class="fas fa-play me-1"></i>Сменить IP
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- SSL режим -->
+                <div class="card operation-card mb-3">
+                    <div class="card-header bg-success text-white">
+                        <h5 class="mb-0"><i class="fas fa-shield-alt me-2"></i>SSL режим</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <select id="sslMode" class="form-select">
+                                    <option value="off">Off - SSL отключен</option>
+                                    <option value="flexible">Flexible - Частичное шифрование</option>
+                                    <option value="full">Full - Полное шифрование</option>
+                                    <option value="strict" selected>Full (strict) - С проверкой сертификата</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <button class="btn btn-success w-100" onclick="changeSSLMode()">
+                                    <i class="fas fa-play me-1"></i>Изменить SSL режим
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- HTTPS -->
+                <div class="card operation-card mb-3">
+                    <div class="card-header bg-warning text-white">
+                        <h5 class="mb-0"><i class="fas fa-globe me-2"></i>Always Use HTTPS</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <select id="httpsMode" class="form-select">
+                                    <option value="1" selected>Включить Always Use HTTPS</option>
+                                    <option value="0">Выключить Always Use HTTPS</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <button class="btn btn-warning w-100" onclick="changeHTTPS()">
+                                    <i class="fas fa-play me-1"></i>Изменить HTTPS
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- TLS версия -->
+                <div class="card operation-card mb-3">
+                    <div class="card-header bg-primary text-white">
+                        <h5 class="mb-0"><i class="fas fa-lock me-2"></i>Минимальная версия TLS</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <select id="tlsVersion" class="form-select">
+                                    <option value="1.0">TLS 1.0</option>
+                                    <option value="1.1">TLS 1.1</option>
+                                    <option value="1.2" selected>TLS 1.2</option>
+                                    <option value="1.3">TLS 1.3</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <button class="btn btn-primary w-100" onclick="changeTLS()">
+                                    <i class="fas fa-play me-1"></i>Изменить TLS версию
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Удаление доменов -->
+                <div class="card operation-card mb-3">
+                    <div class="card-header bg-danger text-white">
+                        <h5 class="mb-0"><i class="fas fa-trash me-2"></i>Удаление доменов</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="alert alert-warning">
+                            <i class="fas fa-exclamation-triangle me-1"></i>
+                            <strong>Внимание!</strong> Это действие нельзя отменить!
+                        </div>
+                        <button class="btn btn-danger w-100" onclick="deleteSelectedDomains()">
+                            <i class="fas fa-trash me-1"></i>Удалить выбранные домены
+                        </button>
+                    </div>
+                </div>
+
+                <!-- МЕГА операция -->
+                <div class="card operation-card">
+                    <div class="card-header bg-danger text-white">
+                        <h5 class="mb-0"><i class="fas fa-rocket me-2"></i>МЕГА-ОПЕРАЦИЯ</h5>
+                    </div>
+                    <div class="card-body">
+                        <p class="card-text">Применить все настройки сразу: IP + SSL (Full strict) + HTTPS (Вкл) + TLS 1.2</p>
+                        <button class="btn btn-danger w-100 btn-lg" onclick="megaOperation()" style="animation: pulse 2s infinite;">
+                            <i class="fas fa-rocket me-1"></i>🚀 ЗАПУСТИТЬ ВСЁ СРАЗУ!
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Лог операций -->
+        <div class="row mt-4">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0"><i class="fas fa-terminal me-2"></i>Лог операций</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="progress mb-3" style="display: none;" id="progressContainer">
+                            <div class="progress-bar" id="progressBar" style="width: 0%">0%</div>
+                        </div>
+                        <div id="operationLog" class="log-container">
+                            Логи операций появятся здесь...
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Управление выбором доменов
+        function toggleSelectAll() {
+            const selectAll = document.getElementById('selectAll');
+            const checkboxes = document.querySelectorAll('.domain-checkbox');
+            
+            checkboxes.forEach(checkbox => {
+                checkbox.checked = selectAll.checked;
+            });
+            
+            updateSelectedCount();
+        }
+
+        function updateSelectedCount() {
+            const checked = document.querySelectorAll('.domain-checkbox:checked').length;
+            document.getElementById('selectedCount').textContent = checked;
+        }
+
+        // Обновляем счетчик при изменении чекбоксов
+        document.addEventListener('change', function(e) {
+            if (e.target.classList.contains('domain-checkbox')) {
+                updateSelectedCount();
+            }
+        });
+
+        // Функции логирования
+        function addLog(message, type = 'info') {
+            const log = document.getElementById('operationLog');
+            const timestamp = new Date().toLocaleTimeString();
+            const colorClass = {
+                'info': 'log-info',
+                'success': 'log-success',
+                'error': 'log-error'
+            }[type] || 'log-info';
+            
+            const logEntry = document.createElement('div');
+            logEntry.className = colorClass;
+            logEntry.textContent = `[${timestamp}] ${message}`;
+            
+            log.appendChild(logEntry);
+            log.scrollTop = log.scrollHeight;
+        }
+
+        function showProgress(current, total) {
+            const container = document.getElementById('progressContainer');
+            const bar = document.getElementById('progressBar');
+            
+            if (current === 0) {
+                container.style.display = 'block';
+            }
+            
+            const percent = Math.round((current / total) * 100);
+            bar.style.width = `${percent}%`;
+            bar.textContent = `${percent}%`;
+            
+            if (current >= total) {
+                setTimeout(() => {
+                    container.style.display = 'none';
+                }, 2000);
+            }
+        }
+
+        function showNotification(message, type = 'info') {
+            const alertClass = {
+                'info': 'alert-info',
+                'success': 'alert-success',
+                'error': 'alert-danger'
+            }[type] || 'alert-info';
+            
+            const alert = document.createElement('div');
+            alert.className = `alert ${alertClass} alert-dismissible fade show position-fixed`;
+            alert.style.cssText = 'top: 20px; right: 20px; z-index: 9999; min-width: 300px;';
+            alert.innerHTML = `
+                ${message}
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            `;
+            
+            document.body.appendChild(alert);
+            
+            setTimeout(() => {
+                if (alert.parentNode) {
+                    alert.remove();
+                }
+            }, 5000);
+        }
+
+        // Получение выбранных доменов
+        function getSelectedDomains() {
+            return Array.from(document.querySelectorAll('.domain-checkbox:checked')).map(cb => cb.value);
+        }
+
+        // Выполнение операции
+        async function performOperation(action, params = {}) {
+            const domains = getSelectedDomains();
+            
+            if (domains.length === 0) {
+                showNotification('Выберите домены для операции', 'error');
+                return;
+            }
+
+            addLog(`Начинаем операцию для ${domains.length} доменов...`, 'info');
+            showProgress(0, domains.length);
+
+            const formData = new FormData();
+            formData.append('action', action);
+            formData.append('domain_ids', JSON.stringify(domains));
+            
+            Object.keys(params).forEach(key => {
+                formData.append(key, params[key]);
+            });
+
+            try {
+                const response = await fetch('mass_operations.php', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    addLog(`✅ Операция завершена! Успешно: ${result.success_count}, ошибок: ${result.error_count}`, 'success');
+                    
+                    // Показываем детали
+                    result.results.forEach((res, index) => {
+                        if (res.success) {
+                            addLog(`✅ Домен ${index + 1}: ${res.message}`, 'success');
+                            
+                            // Если это удаление, удаляем строку из списка
+                            if (action === 'delete_domain' && res.domain_id) {
+                                const domainCheckbox = document.querySelector(`input[value="${res.domain_id}"]`);
+                                if (domainCheckbox) {
+                                    const domainDiv = domainCheckbox.closest('.form-check');
+                                    if (domainDiv) {
+                                        domainDiv.style.animation = 'fadeOut 0.5s';
+                                        setTimeout(() => {
+                                            domainDiv.remove();
+                                            updateSelectedCount();
+                                        }, 500);
+                                    }
+                                }
+                            }
+                        } else {
+                            addLog(`❌ Домен ${index + 1}: ${res.error}`, 'error');
+                        }
+                        showProgress(index + 1, result.results.length);
+                    });
+
+                    showNotification(`Операция завершена! Успешно: ${result.success_count}, ошибок: ${result.error_count}`, 
+                                   result.error_count > 0 ? 'warning' : 'success');
+                } else {
+                    addLog(`❌ Ошибка операции: ${result.error}`, 'error');
+                    showNotification(`Ошибка: ${result.error}`, 'error');
+                }
+            } catch (error) {
+                addLog(`❌ Ошибка соединения: ${error.message}`, 'error');
+                showNotification('Ошибка соединения с сервером', 'error');
+            }
+        }
+
+        // Операции
+        function changeIP() {
+            const newIP = document.getElementById('newIP').value.trim();
+            
+            if (!newIP) {
+                showNotification('Введите новый IP адрес', 'error');
+                return;
+            }
+
+            // Проверка формата IP
+            const ipPattern = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/;
+            if (!ipPattern.test(newIP)) {
+                showNotification('Введите корректный IPv4 адрес', 'error');
+                return;
+            }
+
+            performOperation('change_ip', { new_ip: newIP });
+        }
+
+        function changeSSLMode() {
+            const sslMode = document.getElementById('sslMode').value;
+            performOperation('change_ssl_mode', { ssl_mode: sslMode });
+        }
+
+        function changeHTTPS() {
+            const httpsMode = document.getElementById('httpsMode').value;
+            performOperation('change_https', { always_use_https: httpsMode });
+        }
+
+        function changeTLS() {
+            const tlsVersion = document.getElementById('tlsVersion').value;
+            performOperation('change_tls', { min_tls_version: tlsVersion });
+        }
+
+        function deleteSelectedDomains() {
+            const domains = getSelectedDomains();
+            
+            if (domains.length === 0) {
+                showNotification('Выберите домены для удаления', 'error');
+                return;
+            }
+
+            if (!confirm(`Вы уверены что хотите удалить ${domains.length} доменов?\n\nЭто действие нельзя отменить!`)) {
+                return;
+            }
+
+            performOperation('delete_domain', {});
+        }
+
+        async function megaOperation() {
+            const domains = getSelectedDomains();
+            
+            if (domains.length === 0) {
+                showNotification('Выберите домены для МЕГА-ОПЕРАЦИИ', 'error');
+                return;
+            }
+
+            const newIP = document.getElementById('newIP').value.trim();
+            if (!newIP) {
+                showNotification('Для МЕГА-ОПЕРАЦИИ нужно указать IP адрес', 'error');
+                return;
+            }
+
+            if (!confirm(`🚀 ЗАПУСТИТЬ МЕГА-ОПЕРАЦИЮ для ${domains.length} доменов?\n\nБудет применено:\n- IP: ${newIP}\n- SSL: Full (strict)\n- HTTPS: Включен\n- TLS: 1.2`)) {
+                return;
+            }
+
+            addLog('🚀 ЗАПУСК МЕГА-ОПЕРАЦИИ!', 'info');
+
+            // Выполняем все операции последовательно
+            await performOperation('change_ip', { new_ip: newIP });
+            await performOperation('change_ssl_mode', { ssl_mode: 'strict' });
+            await performOperation('change_https', { always_use_https: '1' });
+            await performOperation('change_tls', { min_tls_version: '1.2' });
+
+            addLog('🎉 МЕГА-ОПЕРАЦИЯ ЗАВЕРШЕНА!', 'success');
+            showNotification('🚀 МЕГА-ОПЕРАЦИЯ ЗАВЕРШЕНА!', 'success');
+        }
+
+        // Инициализация
+        document.addEventListener('DOMContentLoaded', function() {
+            updateSelectedCount();
+            addLog('Интерфейс массовых операций загружен', 'info');
+        });
+    </script>
+</body>
+</html>
