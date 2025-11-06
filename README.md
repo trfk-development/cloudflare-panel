@@ -1033,17 +1033,7 @@ SOFTWARE.
 1. 📖 **Документация:** Прочитайте документацию в `/docs`
 2. 🐛 **Issues:** [GitHub Issues](https://github.com/yourusername/cloudpanel/issues)
 3. 💬 **Discussions:** [GitHub Discussions](https://github.com/yourusername/cloudpanel/discussions)
-4. 📧 **Email:** support@yourproject.com
-
-### Коммерческая поддержка
-
-Нужна помощь с:
-- Установкой и настройкой
-- Кастомизацией под ваши нужды
-- Миграцией с других систем
-- Обучением команды
-
-**Свяжитесь с нами:** business@yourproject.com
+4. 📧 **Telegram:** [support@yourproject.com](https://t.me/seo2cartel)
 
 ---
 
@@ -1079,23 +1069,9 @@ SOFTWARE.
 - [ ] Multi-user support с ролями
 - [ ] Billing интеграция
 
-**Предложите свою идею:** [Feature Request](https://github.com/yourusername/cloudpanel/issues/new?template=feature_request.md)
-
 ---
 
-<div align="center">
-
-## 💖 Поддержите проект
-
-Если CloudPanel помог вам, поддержите разработку:
-
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-☕-yellow)](https://buymeacoffee.com/yourname)
-[![PayPal](https://img.shields.io/badge/PayPal-💰-blue)](https://paypal.me/yourname)
-[![Patreon](https://img.shields.io/badge/Patreon-❤️-red)](https://patreon.com/yourname)
-
----
-
-**Сделано с ❤️ командой CloudPanel**
+**Сделано с ❤️ [командой CloudPanel**](https://t.me/seo2cartel)
 
 [⬆ Наверх](#-cloudpanel)
 
