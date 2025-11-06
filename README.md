@@ -1026,26 +1026,8 @@ SOFTWARE.
 
 ---
 
-## 📞 Поддержка
-
-### Нужна помощь?
-
-1. 📖 **Документация:** Прочитайте документацию в `/docs`
-2. 🐛 **Issues:** [GitHub Issues](https://github.com/yourusername/cloudpanel/issues)
-3. 💬 **Discussions:** [GitHub Discussions](https://github.com/yourusername/cloudpanel/discussions)
+## 📞 Telegram
 4. 📧 **Telegram:** [support@yourproject.com](https://t.me/seo2cartel)
-
----
-
-## 🌟 Статистика проекта
-
-![GitHub stars](https://img.shields.io/github/stars/yourusername/cloudpanel?style=social)
-![GitHub forks](https://img.shields.io/github/forks/yourusername/cloudpanel?style=social)
-![GitHub watchers](https://img.shields.io/github/watchers/yourusername/cloudpanel?style=social)
-
-![GitHub issues](https://img.shields.io/github/issues/yourusername/cloudpanel)
-![GitHub pull requests](https://img.shields.io/github/issues-pr/yourusername/cloudpanel)
-![GitHub last commit](https://img.shields.io/github/last-commit/yourusername/cloudpanel)
 
 ---
 
