@@ -463,10 +463,7 @@ function changeBotFightMode($domain) {
                 logAction($pdo, $userId, "Using Proxy (Bot Fight Mode)", "Proxy: $proxyIp:$proxyPort, Domain: {$domain['domain']}");
             }
         }
-        
-        // Логируем отправляемые данные
-        logAction($pdo, $userId, "Bot Fight Mode Request Payload", "Domain: {$domain['domain']}, Endpoint: zones/{$domain['zone_id']}/bot_management, Payload: $payload");
-        
+       
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $curlError = curl_error($ch);
@@ -666,15 +663,20 @@ function deleteDomainFromMass($domain) {
                     </div>
                     <div class="card-body">
                         <div class="mb-3">
+                            <input type="text" id="domainSearch" class="form-control" placeholder="Поиск по домену..." 
+                                   onkeyup="filterDomains()">
+                        </div>
+                        
+                        <div class="mb-3">
                             <label class="form-check-label">
                                 <input type="checkbox" id="selectAll" class="form-check-input me-2" onchange="toggleSelectAll()">
                                 Выбрать все домены
                             </label>
                         </div>
                         
-                        <div style="max-height: 400px; overflow-y: auto;">
+                        <div id="domainList" style="max-height: 400px; overflow-y: auto;">
                             <?php foreach ($domains as $domain): ?>
-                                <div class="form-check mb-2">
+                                <div class="form-check mb-2 domain-item" data-domain="<?php echo htmlspecialchars(strtolower($domain['domain'])); ?>">
                                     <input class="form-check-input domain-checkbox" type="checkbox" 
                                            value="<?php echo $domain['id']; ?>" id="domain-<?php echo $domain['id']; ?>">
                                     <label class="form-check-label" for="domain-<?php echo $domain['id']; ?>">
@@ -859,7 +861,7 @@ function deleteDomainFromMass($domain) {
         // Управление выбором доменов
         function toggleSelectAll() {
             const selectAll = document.getElementById('selectAll');
-            const checkboxes = document.querySelectorAll('.domain-checkbox');
+            const checkboxes = document.querySelectorAll('.domain-checkbox:not([style*="display: none"])');
             
             checkboxes.forEach(checkbox => {
                 checkbox.checked = selectAll.checked;
@@ -871,6 +873,44 @@ function deleteDomainFromMass($domain) {
         function updateSelectedCount() {
             const checked = document.querySelectorAll('.domain-checkbox:checked').length;
             document.getElementById('selectedCount').textContent = checked;
+        }
+
+        // Фильтрация доменов по поисковому запросу
+        function filterDomains() {
+            const searchTerm = document.getElementById('domainSearch').value.toLowerCase().trim();
+            const domainItems = document.querySelectorAll('.domain-item');
+            let visibleCount = 0;
+            
+            domainItems.forEach(item => {
+                const domainName = item.getAttribute('data-domain');
+                if (searchTerm === '' || domainName.includes(searchTerm)) {
+                    item.style.display = '';
+                    visibleCount++;
+                } else {
+                    item.style.display = 'none';
+                }
+            });
+            
+            // Обновляем счетчик выбранных доменов
+            updateSelectedCount();
+            
+            // Показываем сообщение если ничего не найдено
+            const domainList = document.getElementById('domainList');
+            let noResultsMsg = document.getElementById('noResultsMessage');
+            
+            if (visibleCount === 0 && searchTerm !== '') {
+                if (!noResultsMsg) {
+                    noResultsMsg = document.createElement('div');
+                    noResultsMsg.id = 'noResultsMessage';
+                    noResultsMsg.className = 'alert alert-info mt-3';
+                    noResultsMsg.innerHTML = '<i class="fas fa-info-circle me-1"></i>Домены не найдены';
+                    domainList.appendChild(noResultsMsg);
+                }
+            } else {
+                if (noResultsMsg) {
+                    noResultsMsg.remove();
+                }
+            }
         }
 
         // Обновляем счетчик при изменении чекбоксов
