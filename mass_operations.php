@@ -118,6 +118,9 @@ function performOperation($action, $domainId, $params) {
         case 'change_bot_fight_mode':
             return changeBotFightMode($domain);
             
+        case 'change_ai_labyrinth':
+            return changeAILabyrinth($domain);
+            
         case 'delete_domain':
             return deleteDomainFromMass($domain);
             
@@ -538,6 +541,145 @@ function changeBotFightMode($domain) {
     }
 }
 
+function changeAILabyrinth($domain) {
+    global $pdo, $userId;
+    
+    if (!$domain['zone_id']) {
+        return ['success' => false, 'error' => 'Zone ID не найден', 'domain_id' => $domain['id']];
+    }
+    
+    try {
+        $proxies = getProxies($pdo, $userId);
+        
+        // Получаем API токен для аккаунта
+        $accountId = $domain['account_id'] ?? null;
+        if (!$accountId) {
+            return ['success' => false, 'error' => 'Account ID не найден', 'domain_id' => $domain['id']];
+        }
+        
+        // Получаем первый доступный токен для этого аккаунта
+        $tokens = listCloudflareApiTokens($pdo, $userId, $accountId);
+        if (empty($tokens)) {
+            return ['success' => false, 'error' => 'API токен не найден для этого аккаунта. Добавьте токен в настройках.', 'domain_id' => $domain['id']];
+        }
+        
+        // Используем первый токен (самый свежий, так как они отсортированы по created_at DESC)
+        $apiToken = $tokens[0]['token'];
+        
+        logAction($pdo, $userId, "Mass AI Labyrinth Change Attempt", "Domain: {$domain['domain']}, Enabling AI Labyrinth, Using Token: " . substr($apiToken, 0, 10) . '...');
+        
+        $url = "https://api.cloudflare.com/client/v4/zones/{$domain['zone_id']}/bot_management";
+        $payload = json_encode(['crawler_protection' => 'enabled']);
+        
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PUT');
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
+        
+        // Используем Bearer token для аутентификации
+        $headers = [
+            'Content-Type: application/json',
+            'Content-Length: ' . strlen($payload),
+            'Authorization: Bearer ' . trim($apiToken)
+        ];
+        
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        
+        // Настройка прокси
+        if ($proxies) {
+            $proxy = getRandomProxy($proxies);
+            if ($proxy && preg_match('/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)@([^:@]+):(.+)$/', $proxy, $matches)) {
+                $proxyIp = $matches[1];
+                $proxyPort = $matches[2];
+                $proxyLogin = $matches[3];
+                $proxyPass = $matches[4];
+                
+                curl_setopt($ch, CURLOPT_PROXY, "$proxyIp:$proxyPort");
+                curl_setopt($ch, CURLOPT_PROXYUSERPWD, "$proxyLogin:$proxyPass");
+                curl_setopt($ch, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
+                
+                logAction($pdo, $userId, "Using Proxy (AI Labyrinth)", "Proxy: $proxyIp:$proxyPort, Domain: {$domain['domain']}");
+            }
+        }
+        
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
+        curl_close($ch);
+        
+        if ($curlError) {
+            logAction($pdo, $userId, "AI Labyrinth cURL Error", "Domain: {$domain['domain']}, Error: $curlError");
+            return [
+                'success' => false,
+                'error' => 'cURL Error: ' . $curlError,
+                'domain_id' => $domain['id']
+            ];
+        }
+        
+        $result = json_decode($response, true);
+        
+        // Логируем ответ
+        logAction($pdo, $userId, "AI Labyrinth API Response", 
+            "Domain: {$domain['domain']}, HTTP Code: $httpCode, Success: " . (isset($result['success']) ? ($result['success'] ? 'true' : 'false') : 'unknown') .
+            ", Response: " . substr($response, 0, 500));
+        
+        if ($httpCode === 200 && isset($result['success']) && $result['success']) {
+            $crawlerProtection = $result['result']['crawler_protection'] ?? 'disabled';
+            logAction($pdo, $userId, "AI Labyrinth Change Success", "Domain: {$domain['domain']}, Crawler Protection: $crawlerProtection");
+            
+            return [
+                'success' => true,
+                'message' => "AI Labyrinth включен",
+                'domain_id' => $domain['id'],
+                'result' => $result['result'] ?? null
+            ];
+        } else {
+            $errorMsg = 'Не удалось включить AI Labyrinth через API';
+            $errorDetails = [];
+            
+            if (isset($result['errors']) && is_array($result['errors']) && !empty($result['errors'])) {
+                foreach ($result['errors'] as $err) {
+                    if (is_array($err)) {
+                        $errorDetails[] = ($err['message'] ?? '') . ($err['code'] ? ' (code: ' . $err['code'] . ')' : '');
+                    } else {
+                        $errorDetails[] = (string)$err;
+                    }
+                }
+            }
+            
+            if ($httpCode !== 200) {
+                $errorDetails[] = 'HTTP ' . $httpCode;
+            }
+            
+            if (empty($errorDetails)) {
+                $errorDetails[] = 'Неизвестная ошибка API';
+            }
+            
+            $errorMsg .= ': ' . implode(', ', $errorDetails);
+            
+            logAction($pdo, $userId, "AI Labyrinth Change Failed", "Domain: {$domain['domain']}, Error: $errorMsg");
+            return [
+                'success' => false,
+                'error' => $errorMsg,
+                'domain_id' => $domain['id'],
+                'http_code' => $httpCode
+            ];
+        }
+        
+    } catch (Exception $e) {
+        logAction($pdo, $userId, "AI Labyrinth Change Exception", "Domain: {$domain['domain']}, Error: " . $e->getMessage());
+        return [
+            'success' => false,
+            'error' => 'Ошибка: ' . $e->getMessage(),
+            'domain_id' => $domain['id']
+        ];
+    }
+}
+
 function deleteDomainFromMass($domain) {
     global $pdo, $userId;
     
@@ -801,6 +943,22 @@ function deleteDomainFromMass($domain) {
                         </div>
                         <button class="btn btn-dark w-100" onclick="changeBotFightMode()">
                             <i class="fas fa-shield-virus me-1"></i>Включить Bot Fight Mode
+                        </button>
+                    </div>
+                </div>
+
+                <!-- AI Labyrinth -->
+                <div class="card operation-card mb-3">
+                    <div class="card-header bg-secondary text-white">
+                        <h5 class="mb-0"><i class="fas fa-robot me-2"></i>AI Labyrinth</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="alert alert-info mb-3">
+                            <i class="fas fa-info-circle me-1"></i>
+                            <strong>Информация:</strong> Включает защиту от краулеров (AI Labyrinth) для выбранных доменов.
+                        </div>
+                        <button class="btn btn-secondary w-100" onclick="changeAILabyrinth()">
+                            <i class="fas fa-robot me-1"></i>Включить AI Labyrinth
                         </button>
                     </div>
                 </div>
@@ -1090,6 +1248,10 @@ function deleteDomainFromMass($domain) {
 
         function changeBotFightMode() {
             performOperation('change_bot_fight_mode', {});
+        }
+
+        function changeAILabyrinth() {
+            performOperation('change_ai_labyrinth', {});
         }
 
         function deleteSelectedDomains() {
