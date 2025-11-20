@@ -22,7 +22,7 @@ services:
       chown -R 1000:1000 /var/www/html/cache /var/www/html/migrations &&
       chmod -R 775 /var/www/html/cache /var/www/html/migrations &&
       if [ -f /var/www/html/cloudflare_panel.db ]; then
-        chmod 600 /var/www/html/cloudflare_panel.db &&
+        chmod 660 /var/www/html/cloudflare_panel.db &&
         chown www-data:www-data /var/www/html/cloudflare_panel.db
       fi &&
       php-fpm

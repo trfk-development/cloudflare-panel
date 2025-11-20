@@ -59,15 +59,15 @@ try {
     // Проверяем права доступа к файлу базы данных
     if (!file_exists(DB_PATH)) {
         touch(DB_PATH);
-        chmod(DB_PATH, 0600); // Устанавливаем права 600 (только владелец может читать/писать) для безопасности
+        chmod(DB_PATH, 0660); // Устанавливаем права 660 (владелец и группа могут читать/писать) для безопасности
     } elseif (!is_writable(DB_PATH)) {
         die("Database file is not writable: " . DB_PATH);
     }
     
     // Проверяем и исправляем права доступа, если они слишком широкие
     $currentPerms = fileperms(DB_PATH) & 0777;
-    if ($currentPerms > 0600) {
-        chmod(DB_PATH, 0600);
+    if ($currentPerms > 0660) {
+        chmod(DB_PATH, 0660);
     }
 
     // Создаем соединение с базой данных
