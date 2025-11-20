@@ -409,7 +409,22 @@ function changeBotFightMode($domain) {
     try {
         $proxies = getProxies($pdo, $userId);
         
-        logAction($pdo, $userId, "Mass Bot Fight Mode Change Attempt", "Domain: {$domain['domain']}, Enabling Bot Fight Mode");
+        // Получаем API токен для аккаунта
+        $accountId = $domain['account_id'] ?? null;
+        if (!$accountId) {
+            return ['success' => false, 'error' => 'Account ID не найден', 'domain_id' => $domain['id']];
+        }
+        
+        // Получаем первый доступный токен для этого аккаунта
+        $tokens = listCloudflareApiTokens($pdo, $userId, $accountId);
+        if (empty($tokens)) {
+            return ['success' => false, 'error' => 'API токен не найден для этого аккаунта. Добавьте токен в настройках.', 'domain_id' => $domain['id']];
+        }
+        
+        // Используем первый токен (самый свежий, так как они отсортированы по created_at DESC)
+        $apiToken = $tokens[0]['token'];
+        
+        logAction($pdo, $userId, "Mass Bot Fight Mode Change Attempt", "Domain: {$domain['domain']}, Enabling Bot Fight Mode, Using Token: " . substr($apiToken, 0, 10) . '...');
         
         $url = "https://api.cloudflare.com/client/v4/zones/{$domain['zone_id']}/bot_management";
         $payload = json_encode(['fight_mode' => true]);
@@ -423,22 +438,12 @@ function changeBotFightMode($domain) {
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
         curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
         
-        // Определяем метод аутентификации
+        // Используем Bearer token для аутентификации
         $headers = [
             'Content-Type: application/json',
-            'Content-Length: ' . strlen($payload)
+            'Content-Length: ' . strlen($payload),
+            'Authorization: Bearer ' . trim($apiToken)
         ];
-        
-        // Поддерживаем как Bearer token, так и legacy аутентификацию
-        if ($domain['email'] === null || empty($domain['email']) || strpos($domain['api_key'], 'Bearer ') === 0 || strlen($domain['api_key']) > 40) {
-            // Используем Bearer token
-            $token = strpos($domain['api_key'], 'Bearer ') === 0 ? trim($domain['api_key']) : 'Bearer ' . trim($domain['api_key']);
-            $headers[] = 'Authorization: ' . $token;
-        } else {
-            // Используем legacy аутентификацию (Email + API Key)
-            $headers[] = 'X-Auth-Email: ' . $domain['email'];
-            $headers[] = 'X-Auth-Key: ' . $domain['api_key'];
-        }
         
         curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
         
