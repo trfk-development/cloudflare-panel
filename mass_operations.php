@@ -115,6 +115,9 @@ function performOperation($action, $domainId, $params) {
         case 'change_tls':
             return changeTLS($domain, $params['min_tls_version'] ?? '');
             
+        case 'change_bot_fight_mode':
+            return changeBotFightMode($domain);
+            
         case 'delete_domain':
             return deleteDomainFromMass($domain);
             
@@ -396,6 +399,114 @@ function changeTLS($domain, $minTlsVersion) {
     }
 }
 
+function changeBotFightMode($domain) {
+    global $pdo, $userId;
+    
+    if (!$domain['zone_id']) {
+        return ['success' => false, 'error' => 'Zone ID не найден', 'domain_id' => $domain['id']];
+    }
+    
+    try {
+        $proxies = getProxies($pdo, $userId);
+        
+        logAction($pdo, $userId, "Mass Bot Fight Mode Change Attempt", "Domain: {$domain['domain']}, Enabling Bot Fight Mode");
+        
+        // Обновляем Bot Fight Mode через Cloudflare API
+        // Пробуем основной endpoint
+        $result = cloudflareApiRequestDetailed(
+            $pdo,
+            $domain['email'],
+            $domain['api_key'],
+            "zones/{$domain['zone_id']}/bot_management",
+            'PUT',
+            ['fight_mode' => true],
+            $proxies,
+            $userId
+        );
+        
+        // Если не получилось, пробуем альтернативный endpoint
+        if (!$result || !isset($result['success']) || !$result['success']) {
+            logAction($pdo, $userId, "Mass Bot Fight Mode Retry", "Domain: {$domain['domain']}, Trying alternative endpoint structure");
+            $result = cloudflareApiRequestDetailed(
+                $pdo,
+                $domain['email'],
+                $domain['api_key'],
+                "zones/{$domain['zone_id']}/settings/bot_management",
+                'PATCH',
+                ['value' => ['fight_mode' => true]],
+                $proxies,
+                $userId
+            );
+        }
+        
+        // Детальное логирование ответа для отладки
+        logAction($pdo, $userId, "Mass Bot Fight Mode API Response", 
+            "Domain: {$domain['domain']}, Success: " . (isset($result['success']) ? ($result['success'] ? 'true' : 'false') : 'not set') . 
+            ", HTTP Code: " . ($result['http_code'] ?? 'unknown') . 
+            ", Errors: " . json_encode($result['api_errors'] ?? []) . 
+            ", cURL Error: " . ($result['curl_error'] ?? 'none') . 
+            ", Raw Response: " . substr($result['raw_response'] ?? '', 0, 500));
+        
+        if ($result && isset($result['success']) && $result['success']) {
+            logAction($pdo, $userId, "Mass Bot Fight Mode Change Success", "Domain: {$domain['domain']}, Bot Fight Mode enabled");
+            
+            return [
+                'success' => true,
+                'message' => "Bot Fight Mode включен",
+                'domain_id' => $domain['id']
+            ];
+        } else {
+            $errorMsg = 'Не удалось включить Bot Fight Mode через API';
+            $errorDetails = [];
+            
+            // Проверяем различные источники ошибок
+            if (isset($result['api_errors']) && is_array($result['api_errors']) && !empty($result['api_errors'])) {
+                foreach ($result['api_errors'] as $err) {
+                    if (is_array($err)) {
+                        $errorDetails[] = $err['message'] ?? $err['code'] ?? 'Unknown error';
+                    } else if (is_object($err)) {
+                        $errorDetails[] = $err->message ?? $err->code ?? 'Unknown error';
+                    } else {
+                        $errorDetails[] = (string)$err;
+                    }
+                }
+            }
+            
+            if (isset($result['curl_error']) && !empty($result['curl_error'])) {
+                $errorDetails[] = 'cURL: ' . $result['curl_error'];
+            }
+            
+            if (isset($result['http_code']) && $result['http_code'] !== 200) {
+                $errorDetails[] = 'HTTP ' . $result['http_code'];
+            }
+            
+            if (isset($result['raw_response']) && !empty($result['raw_response'])) {
+                $decoded = json_decode($result['raw_response'], true);
+                if ($decoded && isset($decoded['errors']) && is_array($decoded['errors'])) {
+                    foreach ($decoded['errors'] as $err) {
+                        if (is_array($err)) {
+                            $errorDetails[] = ($err['message'] ?? '') . ($err['code'] ? ' (code: ' . $err['code'] . ')' : '');
+                        }
+                    }
+                }
+            }
+            
+            if (empty($errorDetails)) {
+                $errorDetails[] = 'Неизвестная ошибка API';
+            }
+            
+            $errorMsg .= ': ' . implode(', ', $errorDetails);
+            
+            logAction($pdo, $userId, "Mass Bot Fight Mode Change Failed", "Domain: {$domain['domain']}, Error: $errorMsg");
+            return ['success' => false, 'error' => $errorMsg, 'domain_id' => $domain['id']];
+        }
+        
+    } catch (Exception $e) {
+        logAction($pdo, $userId, "Mass Bot Fight Mode Change Exception", "Domain: {$domain['domain']}, Error: " . $e->getMessage());
+        return ['success' => false, 'error' => 'Ошибка API: ' . $e->getMessage(), 'domain_id' => $domain['id']];
+    }
+}
+
 function deleteDomainFromMass($domain) {
     global $pdo, $userId;
     
@@ -642,6 +753,22 @@ function deleteDomainFromMass($domain) {
                     </div>
                 </div>
 
+                <!-- Bot Fight Mode -->
+                <div class="card operation-card mb-3">
+                    <div class="card-header bg-dark text-white">
+                        <h5 class="mb-0"><i class="fas fa-shield-virus me-2"></i>Bot Fight Mode</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="alert alert-info mb-3">
+                            <i class="fas fa-info-circle me-1"></i>
+                            <strong>Информация:</strong> Включает защиту от ботов для выбранных доменов.
+                        </div>
+                        <button class="btn btn-dark w-100" onclick="changeBotFightMode()">
+                            <i class="fas fa-shield-virus me-1"></i>Включить Bot Fight Mode
+                        </button>
+                    </div>
+                </div>
+
                 <!-- Удаление доменов -->
                 <div class="card operation-card mb-3">
                     <div class="card-header bg-danger text-white">
@@ -885,6 +1012,10 @@ function deleteDomainFromMass($domain) {
         function changeTLS() {
             const tlsVersion = document.getElementById('tlsVersion').value;
             performOperation('change_tls', { min_tls_version: tlsVersion });
+        }
+
+        function changeBotFightMode() {
+            performOperation('change_bot_fight_mode', {});
         }
 
         function deleteSelectedDomains() {
