@@ -1,7 +1,8 @@
 <?php
-require_once 'header.php';
+require_once 'config.php';
 require_once 'functions.php';
 require_once 'handle_forms.php';
+require_once 'header.php';
 
 if (!isset($_SESSION['user_id'])) {
     header('Location: ' . BASE_PATH . 'login.php');
