@@ -411,84 +411,104 @@ function changeBotFightMode($domain) {
         
         logAction($pdo, $userId, "Mass Bot Fight Mode Change Attempt", "Domain: {$domain['domain']}, Enabling Bot Fight Mode");
         
-        // Обновляем Bot Fight Mode через Cloudflare API
-        // Пробуем основной endpoint
-        $result = cloudflareApiRequestDetailed(
-            $pdo,
-            $domain['email'],
-            $domain['api_key'],
-            "zones/{$domain['zone_id']}/bot_management",
-            'PUT',
-            ['fight_mode' => true],
-            $proxies,
-            $userId
-        );
+        $url = "https://api.cloudflare.com/client/v4/zones/{$domain['zone_id']}/bot_management";
+        $payload = json_encode(['fight_mode' => true]);
         
-        // Если не получилось, пробуем альтернативный endpoint
-        if (!$result || !isset($result['success']) || !$result['success']) {
-            logAction($pdo, $userId, "Mass Bot Fight Mode Retry", "Domain: {$domain['domain']}, Trying alternative endpoint structure");
-            $result = cloudflareApiRequestDetailed(
-                $pdo,
-                $domain['email'],
-                $domain['api_key'],
-                "zones/{$domain['zone_id']}/settings/bot_management",
-                'PATCH',
-                ['value' => ['fight_mode' => true]],
-                $proxies,
-                $userId
-            );
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PUT');
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
+        
+        // Определяем метод аутентификации
+        $headers = [
+            'Content-Type: application/json',
+            'Content-Length: ' . strlen($payload)
+        ];
+        
+        // Поддерживаем как Bearer token, так и legacy аутентификацию
+        if ($domain['email'] === null || empty($domain['email']) || strpos($domain['api_key'], 'Bearer ') === 0 || strlen($domain['api_key']) > 40) {
+            // Используем Bearer token
+            $token = strpos($domain['api_key'], 'Bearer ') === 0 ? trim($domain['api_key']) : 'Bearer ' . trim($domain['api_key']);
+            $headers[] = 'Authorization: ' . $token;
+        } else {
+            // Используем legacy аутентификацию (Email + API Key)
+            $headers[] = 'X-Auth-Email: ' . $domain['email'];
+            $headers[] = 'X-Auth-Key: ' . $domain['api_key'];
         }
         
-        // Детальное логирование ответа для отладки
-        logAction($pdo, $userId, "Mass Bot Fight Mode API Response", 
-            "Domain: {$domain['domain']}, Success: " . (isset($result['success']) ? ($result['success'] ? 'true' : 'false') : 'not set') . 
-            ", HTTP Code: " . ($result['http_code'] ?? 'unknown') . 
-            ", Errors: " . json_encode($result['api_errors'] ?? []) . 
-            ", cURL Error: " . ($result['curl_error'] ?? 'none') . 
-            ", Raw Response: " . substr($result['raw_response'] ?? '', 0, 500));
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
         
-        if ($result && isset($result['success']) && $result['success']) {
-            logAction($pdo, $userId, "Mass Bot Fight Mode Change Success", "Domain: {$domain['domain']}, Bot Fight Mode enabled");
+        // Настройка прокси
+        if ($proxies) {
+            $proxy = getRandomProxy($proxies);
+            if ($proxy && preg_match('/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)@([^:@]+):(.+)$/', $proxy, $matches)) {
+                $proxyIp = $matches[1];
+                $proxyPort = $matches[2];
+                $proxyLogin = $matches[3];
+                $proxyPass = $matches[4];
+                
+                curl_setopt($ch, CURLOPT_PROXY, "$proxyIp:$proxyPort");
+                curl_setopt($ch, CURLOPT_PROXYUSERPWD, "$proxyLogin:$proxyPass");
+                curl_setopt($ch, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
+                
+                logAction($pdo, $userId, "Using Proxy (Bot Fight Mode)", "Proxy: $proxyIp:$proxyPort, Domain: {$domain['domain']}");
+            }
+        }
+        
+        // Логируем отправляемые данные
+        logAction($pdo, $userId, "Bot Fight Mode Request Payload", "Domain: {$domain['domain']}, Endpoint: zones/{$domain['zone_id']}/bot_management, Payload: $payload");
+        
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
+        curl_close($ch);
+        
+        if ($curlError) {
+            logAction($pdo, $userId, "Bot Fight Mode cURL Error", "Domain: {$domain['domain']}, Error: $curlError");
+            return [
+                'success' => false,
+                'error' => 'cURL Error: ' . $curlError,
+                'domain_id' => $domain['id']
+            ];
+        }
+        
+        $result = json_decode($response, true);
+        
+        // Логируем ответ
+        logAction($pdo, $userId, "Bot Fight Mode API Response", 
+            "Domain: {$domain['domain']}, HTTP Code: $httpCode, Success: " . (isset($result['success']) ? ($result['success'] ? 'true' : 'false') : 'unknown') .
+            ", Response: " . substr($response, 0, 500));
+        
+        if ($httpCode === 200 && isset($result['success']) && $result['success']) {
+            $fightMode = $result['result']['fight_mode'] ?? false;
+            logAction($pdo, $userId, "Bot Fight Mode Change Success", "Domain: {$domain['domain']}, Bot Fight Mode: " . ($fightMode ? 'enabled' : 'disabled'));
             
             return [
                 'success' => true,
                 'message' => "Bot Fight Mode включен",
-                'domain_id' => $domain['id']
+                'domain_id' => $domain['id'],
+                'result' => $result['result'] ?? null
             ];
         } else {
             $errorMsg = 'Не удалось включить Bot Fight Mode через API';
             $errorDetails = [];
             
-            // Проверяем различные источники ошибок
-            if (isset($result['api_errors']) && is_array($result['api_errors']) && !empty($result['api_errors'])) {
-                foreach ($result['api_errors'] as $err) {
+            if (isset($result['errors']) && is_array($result['errors']) && !empty($result['errors'])) {
+                foreach ($result['errors'] as $err) {
                     if (is_array($err)) {
-                        $errorDetails[] = $err['message'] ?? $err['code'] ?? 'Unknown error';
-                    } else if (is_object($err)) {
-                        $errorDetails[] = $err->message ?? $err->code ?? 'Unknown error';
+                        $errorDetails[] = ($err['message'] ?? '') . ($err['code'] ? ' (code: ' . $err['code'] . ')' : '');
                     } else {
                         $errorDetails[] = (string)$err;
                     }
                 }
             }
             
-            if (isset($result['curl_error']) && !empty($result['curl_error'])) {
-                $errorDetails[] = 'cURL: ' . $result['curl_error'];
-            }
-            
-            if (isset($result['http_code']) && $result['http_code'] !== 200) {
-                $errorDetails[] = 'HTTP ' . $result['http_code'];
-            }
-            
-            if (isset($result['raw_response']) && !empty($result['raw_response'])) {
-                $decoded = json_decode($result['raw_response'], true);
-                if ($decoded && isset($decoded['errors']) && is_array($decoded['errors'])) {
-                    foreach ($decoded['errors'] as $err) {
-                        if (is_array($err)) {
-                            $errorDetails[] = ($err['message'] ?? '') . ($err['code'] ? ' (code: ' . $err['code'] . ')' : '');
-                        }
-                    }
-                }
+            if ($httpCode !== 200) {
+                $errorDetails[] = 'HTTP ' . $httpCode;
             }
             
             if (empty($errorDetails)) {
@@ -497,13 +517,22 @@ function changeBotFightMode($domain) {
             
             $errorMsg .= ': ' . implode(', ', $errorDetails);
             
-            logAction($pdo, $userId, "Mass Bot Fight Mode Change Failed", "Domain: {$domain['domain']}, Error: $errorMsg");
-            return ['success' => false, 'error' => $errorMsg, 'domain_id' => $domain['id']];
+            logAction($pdo, $userId, "Bot Fight Mode Change Failed", "Domain: {$domain['domain']}, Error: $errorMsg");
+            return [
+                'success' => false,
+                'error' => $errorMsg,
+                'domain_id' => $domain['id'],
+                'http_code' => $httpCode
+            ];
         }
         
     } catch (Exception $e) {
-        logAction($pdo, $userId, "Mass Bot Fight Mode Change Exception", "Domain: {$domain['domain']}, Error: " . $e->getMessage());
-        return ['success' => false, 'error' => 'Ошибка API: ' . $e->getMessage(), 'domain_id' => $domain['id']];
+        logAction($pdo, $userId, "Bot Fight Mode Change Exception", "Domain: {$domain['domain']}, Error: " . $e->getMessage());
+        return [
+            'success' => false,
+            'error' => 'Ошибка: ' . $e->getMessage(),
+            'domain_id' => $domain['id']
+        ];
     }
 }
 
