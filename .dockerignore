@@ -1,0 +1,10 @@
+.git
+.github
+.gitignore
+*.md
+!docker/*.md
+.env
+cloudflare_panel.db
+credentials.txt
+cache/*
+!cache/.gitkeep

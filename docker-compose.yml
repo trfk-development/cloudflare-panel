@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  php:
+    image: php:8.1-fpm
+    container_name: cloudflare-panel-php
+    working_dir: /var/www/html
+    volumes:
+      - .:/var/www/html
+    networks:
+      - cloudflare-panel-network
+    environment:
+      - PHP_MEMORY_LIMIT=256M
+      - PHP_UPLOAD_MAX_FILESIZE=20M
+      - PHP_POST_MAX_SIZE=20M
+    command: >
+      bash -c "
+      apt-get update &&
+      apt-get install -y libsqlite3-dev sqlite3 &&
+      docker-php-ext-install pdo pdo_sqlite &&
+      mkdir -p /var/www/html/cache /var/www/html/migrations &&
+      chown -R 1000:1000 /var/www/html/cache /var/www/html/migrations &&
+      chmod -R 775 /var/www/html/cache /var/www/html/migrations &&
+      if [ -f /var/www/html/cloudflare_panel.db ]; then
+        chmod 600 /var/www/html/cloudflare_panel.db &&
+        chown www-data:www-data /var/www/html/cloudflare_panel.db
+      fi &&
+      php-fpm
+      "
+
+  nginx:
+    image: nginx:alpine
+    container_name: cloudflare-panel-nginx
+    working_dir: /var/www/html
+    volumes:
+      - .:/var/www/html
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf
+    ports:
+      - "8080:80"
+    depends_on:
+      - php
+    networks:
+      - cloudflare-panel-network
+
+networks:
+  cloudflare-panel-network:
+    driver: bridge
