@@ -18,14 +18,17 @@ if (!isset($_SESSION['user_id'])) {
 
 $userId = $_SESSION['user_id'];
 
-// Получаем домены пользователя
+// Получаем домены пользователя с информацией о наличии API токена
 $stmt = $pdo->prepare("
     SELECT ca.id, ca.domain, ca.zone_id, ca.dns_ip, ca.ssl_mode, ca.always_use_https, 
-           ca.min_tls_version, g.name as group_name, cc.email
+           ca.min_tls_version, g.name as group_name, cc.email, ca.account_id,
+           CASE WHEN cat.id IS NOT NULL THEN 1 ELSE 0 END as has_api_token
     FROM cloudflare_accounts ca
     JOIN cloudflare_credentials cc ON ca.account_id = cc.id
     LEFT JOIN groups g ON ca.group_id = g.id
+    LEFT JOIN cloudflare_api_tokens cat ON ca.account_id = cat.account_id AND cat.user_id = ca.user_id
     WHERE ca.user_id = ?
+    GROUP BY ca.id
     ORDER BY ca.domain ASC
 ");
 $stmt->execute([$userId]);
@@ -963,6 +966,15 @@ function deleteDomainFromMass($domain) {
                         </div>
                         
                         <div class="mb-3">
+                            <div class="form-check form-switch">
+                                <input class="form-check-input" type="checkbox" id="hasApiTokenFilter" onchange="filterDomains()">
+                                <label class="form-check-label" for="hasApiTokenFilter">
+                                    <i class="fas fa-key me-1"></i>Has API token
+                                </label>
+                            </div>
+                        </div>
+                        
+                        <div class="mb-3">
                             <label class="form-check-label">
                                 <input type="checkbox" id="selectAll" class="form-check-input me-2" onchange="toggleSelectAll()">
                                 Выбрать все домены
@@ -971,11 +983,17 @@ function deleteDomainFromMass($domain) {
                         
                         <div id="domainList" style="max-height: 400px; overflow-y: auto;">
                             <?php foreach ($domains as $domain): ?>
-                                <div class="form-check mb-2 domain-item" data-domain="<?php echo htmlspecialchars(strtolower($domain['domain'])); ?>">
+                                <div class="form-check mb-2 domain-item" 
+                                     data-domain="<?php echo htmlspecialchars(strtolower($domain['domain'])); ?>"
+                                     data-has-api-token="<?php echo $domain['has_api_token'] ? '1' : '0'; ?>">
                                     <input class="form-check-input domain-checkbox" type="checkbox" 
                                            value="<?php echo $domain['id']; ?>" id="domain-<?php echo $domain['id']; ?>">
                                     <label class="form-check-label" for="domain-<?php echo $domain['id']; ?>">
-                                        <strong><?php echo htmlspecialchars($domain['domain']); ?></strong><br>
+                                        <strong><?php echo htmlspecialchars($domain['domain']); ?></strong>
+                                        <?php if ($domain['has_api_token']): ?>
+                                            <i class="fas fa-key text-success ms-1" title="Has API token"></i>
+                                        <?php endif; ?>
+                                        <br>
                                         <small class="text-muted">
                                             <?php echo htmlspecialchars($domain['group_name'] ?? 'Без группы'); ?>
                                             • IP: <?php echo htmlspecialchars($domain['dns_ip'] ?? 'Не указан'); ?>
@@ -1217,21 +1235,35 @@ function deleteDomainFromMass($domain) {
             
             updateSelectedCount();
         }
+        
+        // Обновляем счетчик при изменении фильтров
+        document.getElementById('hasApiTokenFilter').addEventListener('change', function() {
+            updateSelectedCount();
+        });
 
         function updateSelectedCount() {
             const checked = document.querySelectorAll('.domain-checkbox:checked').length;
             document.getElementById('selectedCount').textContent = checked;
         }
 
-        // Фильтрация доменов по поисковому запросу
+        // Фильтрация доменов по поисковому запросу и API token
         function filterDomains() {
             const searchTerm = document.getElementById('domainSearch').value.toLowerCase().trim();
+            const hasApiTokenFilter = document.getElementById('hasApiTokenFilter').checked;
             const domainItems = document.querySelectorAll('.domain-item');
             let visibleCount = 0;
             
             domainItems.forEach(item => {
                 const domainName = item.getAttribute('data-domain');
-                if (searchTerm === '' || domainName.includes(searchTerm)) {
+                const hasApiToken = item.getAttribute('data-has-api-token') === '1';
+                
+                // Проверка поискового запроса
+                const matchesSearch = searchTerm === '' || domainName.includes(searchTerm);
+                
+                // Проверка фильтра API token
+                const matchesApiTokenFilter = !hasApiTokenFilter || hasApiToken;
+                
+                if (matchesSearch && matchesApiTokenFilter) {
                     item.style.display = '';
                     visibleCount++;
                 } else {
@@ -1246,7 +1278,7 @@ function deleteDomainFromMass($domain) {
             const domainList = document.getElementById('domainList');
             let noResultsMsg = document.getElementById('noResultsMessage');
             
-            if (visibleCount === 0 && searchTerm !== '') {
+            if (visibleCount === 0 && (searchTerm !== '' || hasApiTokenFilter)) {
                 if (!noResultsMsg) {
                     noResultsMsg = document.createElement('div');
                     noResultsMsg.id = 'noResultsMessage';
