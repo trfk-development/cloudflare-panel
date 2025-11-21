@@ -124,6 +124,12 @@ function performOperation($action, $domainId, $params) {
         case 'delete_domain':
             return deleteDomainFromMass($domain);
             
+        case 'purge_cache':
+            return purgeCache($domain);
+            
+        case 'configure_caching':
+            return configureCaching($domain);
+            
         default:
             return ['success' => false, 'error' => 'Неизвестная операция', 'domain_id' => $domainId];
     }
@@ -680,6 +686,153 @@ function changeAILabyrinth($domain) {
     }
 }
 
+function purgeCache($domain) {
+    global $pdo, $userId;
+    
+    if (!$domain['zone_id']) {
+        return ['success' => false, 'error' => 'Zone ID не найден', 'domain_id' => $domain['id']];
+    }
+    
+    try {
+        $proxies = getProxies($pdo, $userId);
+        $zoneId = $domain['zone_id'];
+        
+        logAction($pdo, $userId, "Mass Cache Purge Attempt", "Domain: {$domain['domain']}, Zone: $zoneId");
+        
+        $payload = ['purge_everything' => true];
+        $purgeResp = cloudflareApiRequestDetailed($pdo, $domain['email'], $domain['api_key'], "zones/$zoneId/purge_cache", 'POST', $payload, $proxies, $userId);
+        
+        if ($purgeResp['success']) {
+            logAction($pdo, $userId, "Mass Cache Purge Success", "Domain: {$domain['domain']}, Zone: $zoneId");
+            
+            return [
+                'success' => true,
+                'message' => "Кеш очищен",
+                'domain_id' => $domain['id'],
+                'zone_id' => $zoneId
+            ];
+        } else {
+            $err = 'Не удалось очистить кеш';
+            if (!empty($purgeResp['api_errors'])) {
+                $err .= ': ' . implode(', ', array_map(fn($e) => ($e['code'] ?? '?') . ' ' . ($e['message'] ?? 'unknown'), $purgeResp['api_errors']));
+            }
+            
+            logAction($pdo, $userId, "Mass Cache Purge Failed", "Domain: {$domain['domain']}, Error: $err");
+            return ['success' => false, 'error' => $err, 'domain_id' => $domain['id']];
+        }
+        
+    } catch (Exception $e) {
+        logAction($pdo, $userId, "Mass Cache Purge Exception", "Domain: {$domain['domain']}, Error: " . $e->getMessage());
+        return ['success' => false, 'error' => 'Ошибка API: ' . $e->getMessage(), 'domain_id' => $domain['id']];
+    }
+}
+
+function configureCaching($domain) {
+    global $pdo, $userId;
+    
+    if (!$domain['zone_id']) {
+        return ['success' => false, 'error' => 'Zone ID не найден', 'domain_id' => $domain['id']];
+    }
+    
+    try {
+        $proxies = getProxies($pdo, $userId);
+        $zoneId = $domain['zone_id'];
+        
+        logAction($pdo, $userId, "Mass Configure Caching Attempt", "Domain: {$domain['domain']}, Zone: $zoneId");
+        
+        // Определяем базовый URL (с протоколом)
+        $baseUrl = $domain['domain'];
+        $domainPattern = "*{$baseUrl}";
+        
+        // Паттерны для правил
+        $patterns = [
+            'assets' => "{$domainPattern}/assets/*",
+            'js' => "{$domainPattern}/js/*",
+            'build' => "{$domainPattern}/build/*"
+        ];
+        
+        // Настройки кеширования
+        $browserCacheTTL = 86400; // 1 день в секундах
+        $edgeCacheTTL = 604800; // 7 дней в секундах
+        
+        $createdRules = [];
+        $failedRules = [];
+        $priority = 1;
+        
+        // Создаем 3 правила для каждого паттерна
+        foreach ($patterns as $name => $pattern) {
+            $rule = [
+                'targets' => [[
+                    'target' => 'url',
+                    'constraint' => [
+                        'operator' => 'matches',
+                        'value' => $pattern
+                    ]
+                ]],
+                'actions' => [
+                    [
+                        'id' => 'browser_cache_ttl',
+                        'value' => $browserCacheTTL
+                    ],
+                    [
+                        'id' => 'cache_level',
+                        'value' => 'cache_everything'
+                    ],
+                    [
+                        'id' => 'edge_cache_ttl',
+                        'value' => $edgeCacheTTL
+                    ]
+                ],
+                'status' => 'active',
+                'priority' => $priority++
+            ];
+            
+            $resp = cloudflareApiRequestDetailed($pdo, $domain['email'], $domain['api_key'], "zones/$zoneId/pagerules", 'POST', $rule, $proxies, $userId);
+            
+            if ($resp['success']) {
+                $createdRules[] = $name;
+                logAction($pdo, $userId, "Mass Configure Caching Rule Created", "Domain: {$domain['domain']}, Pattern: $pattern, Rule: $name");
+            } else {
+                $err = "Не удалось создать правило для $name";
+                if (!empty($resp['api_errors'])) {
+                    $err .= ': ' . implode(', ', array_map(fn($e) => ($e['code'] ?? '?') . ' ' . ($e['message'] ?? 'unknown'), $resp['api_errors']));
+                }
+                $failedRules[] = $err;
+                logAction($pdo, $userId, "Mass Configure Caching Rule Failed", "Domain: {$domain['domain']}, Pattern: $pattern, Error: $err");
+            }
+            
+            // Небольшая задержка между запросами
+            usleep(200000); // 0.2 секунды
+        }
+        
+        if (count($createdRules) > 0) {
+            $message = "Создано правил: " . count($createdRules) . " из " . count($patterns);
+            if (count($failedRules) > 0) {
+                $message .= ". Ошибки: " . implode('; ', $failedRules);
+            }
+            
+            logAction($pdo, $userId, "Mass Configure Caching Success", "Domain: {$domain['domain']}, Created: " . implode(', ', $createdRules));
+            
+            return [
+                'success' => true,
+                'message' => $message,
+                'domain_id' => $domain['id'],
+                'zone_id' => $zoneId,
+                'created_rules' => $createdRules,
+                'failed_rules' => $failedRules
+            ];
+        } else {
+            $err = 'Не удалось создать ни одно правило: ' . implode('; ', $failedRules);
+            logAction($pdo, $userId, "Mass Configure Caching Failed", "Domain: {$domain['domain']}, Error: $err");
+            return ['success' => false, 'error' => $err, 'domain_id' => $domain['id']];
+        }
+        
+    } catch (Exception $e) {
+        logAction($pdo, $userId, "Mass Configure Caching Exception", "Domain: {$domain['domain']}, Error: " . $e->getMessage());
+        return ['success' => false, 'error' => 'Ошибка API: ' . $e->getMessage(), 'domain_id' => $domain['id']];
+    }
+}
+
 function deleteDomainFromMass($domain) {
     global $pdo, $userId;
     
@@ -959,6 +1112,43 @@ function deleteDomainFromMass($domain) {
                         </div>
                         <button class="btn btn-secondary w-100" onclick="changeAILabyrinth()">
                             <i class="fas fa-robot me-1"></i>Включить AI Labyrinth
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Очистка кеша -->
+                <div class="card operation-card mb-3">
+                    <div class="card-header bg-purple text-white" style="background-color: #6f42c1 !important;">
+                        <h5 class="mb-0"><i class="fas fa-broom me-2"></i>Очистка кеша</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="alert alert-info mb-3">
+                            <i class="fas fa-info-circle me-1"></i>
+                            <strong>Информация:</strong> Очищает весь кеш Cloudflare для выбранных доменов.
+                        </div>
+                        <button class="btn w-100" onclick="purgeCache()" style="background-color: #6f42c1; color: white;">
+                            <i class="fas fa-broom me-1"></i>Очистить кеш
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Настройка кеширования -->
+                <div class="card operation-card mb-3">
+                    <div class="card-header text-white" style="background-color: #17a2b8 !important;">
+                        <h5 class="mb-0"><i class="fas fa-cog me-2"></i>Настроить кеширование</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="alert alert-info mb-3">
+                            <i class="fas fa-info-circle me-1"></i>
+                            <strong>Информация:</strong> Создает 3 правила кеширования для каждого домена:
+                            <ul class="mb-0 mt-2">
+                                <li><code>/assets/*</code> - Browser Cache: 1 день, Cache Level: Cache Everything, Edge Cache: 7 дней</li>
+                                <li><code>/js/*</code> - Browser Cache: 1 день, Cache Level: Cache Everything, Edge Cache: 7 дней</li>
+                                <li><code>/build/*</code> - Browser Cache: 1 день, Cache Level: Cache Everything, Edge Cache: 7 дней</li>
+                            </ul>
+                        </div>
+                        <button class="btn w-100" onclick="configureCaching()" style="background-color: #17a2b8; color: white;">
+                            <i class="fas fa-cog me-1"></i>Настроить кеширование
                         </button>
                     </div>
                 </div>
@@ -1252,6 +1442,36 @@ function deleteDomainFromMass($domain) {
 
         function changeAILabyrinth() {
             performOperation('change_ai_labyrinth', {});
+        }
+
+        function purgeCache() {
+            const domains = getSelectedDomains();
+            
+            if (domains.length === 0) {
+                showNotification('Выберите домены для очистки кеша', 'error');
+                return;
+            }
+
+            if (!confirm(`Очистить кеш для ${domains.length} выбранных доменов?`)) {
+                return;
+            }
+
+            performOperation('purge_cache', {});
+        }
+
+        function configureCaching() {
+            const domains = getSelectedDomains();
+            
+            if (domains.length === 0) {
+                showNotification('Выберите домены для настройки кеширования', 'error');
+                return;
+            }
+
+            if (!confirm(`Настроить кеширование для ${domains.length} выбранных доменов?\n\nБудут созданы 3 правила для каждого домена:\n- /assets/*\n- /js/*\n- /build/*`)) {
+                return;
+            }
+
+            performOperation('configure_caching', {});
         }
 
         function deleteSelectedDomains() {
