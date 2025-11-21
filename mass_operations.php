@@ -119,10 +119,10 @@ function performOperation($action, $domainId, $params) {
             return changeTLS($domain, $params['min_tls_version'] ?? '');
             
         case 'change_bot_fight_mode':
-            return changeBotFightMode($domain);
+            return changeBotFightMode($domain, $params['enabled'] ?? '1');
             
         case 'change_ai_labyrinth':
-            return changeAILabyrinth($domain);
+            return changeAILabyrinth($domain, $params['enabled'] ?? '1');
             
         case 'delete_domain':
             return deleteDomainFromMass($domain);
@@ -411,7 +411,7 @@ function changeTLS($domain, $minTlsVersion) {
     }
 }
 
-function changeBotFightMode($domain) {
+function changeBotFightMode($domain, $enabled = '1') {
     global $pdo, $userId;
     
     if (!$domain['zone_id']) {
@@ -436,10 +436,14 @@ function changeBotFightMode($domain) {
         // Используем первый токен (самый свежий, так как они отсортированы по created_at DESC)
         $apiToken = $tokens[0]['token'];
         
-        logAction($pdo, $userId, "Mass Bot Fight Mode Change Attempt", "Domain: {$domain['domain']}, Enabling Bot Fight Mode, Using Token: " . substr($apiToken, 0, 10) . '...');
+        // Преобразуем строковое значение в boolean
+        $fightModeEnabled = ($enabled === '1' || $enabled === 1 || $enabled === true);
+        $action = $fightModeEnabled ? 'Enabling' : 'Disabling';
+        
+        logAction($pdo, $userId, "Mass Bot Fight Mode Change Attempt", "Domain: {$domain['domain']}, $action Bot Fight Mode, Using Token: " . substr($apiToken, 0, 10) . '...');
         
         $url = "https://api.cloudflare.com/client/v4/zones/{$domain['zone_id']}/bot_management";
-        $payload = json_encode(['fight_mode' => true]);
+        $payload = json_encode(['fight_mode' => $fightModeEnabled]);
         
         $ch = curl_init($url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -499,16 +503,20 @@ function changeBotFightMode($domain) {
         
         if ($httpCode === 200 && isset($result['success']) && $result['success']) {
             $fightMode = $result['result']['fight_mode'] ?? false;
-            logAction($pdo, $userId, "Bot Fight Mode Change Success", "Domain: {$domain['domain']}, Bot Fight Mode: " . ($fightMode ? 'enabled' : 'disabled'));
+            $status = $fightMode ? 'enabled' : 'disabled';
+            logAction($pdo, $userId, "Bot Fight Mode Change Success", "Domain: {$domain['domain']}, Bot Fight Mode: $status");
+            
+            $message = $fightMode ? "Bot Fight Mode включен" : "Bot Fight Mode выключен";
             
             return [
                 'success' => true,
-                'message' => "Bot Fight Mode включен",
+                'message' => $message,
                 'domain_id' => $domain['id'],
                 'result' => $result['result'] ?? null
             ];
         } else {
-            $errorMsg = 'Не удалось включить Bot Fight Mode через API';
+            $actionText = $fightModeEnabled ? 'включить' : 'выключить';
+            $errorMsg = "Не удалось $actionText Bot Fight Mode через API";
             $errorDetails = [];
             
             if (isset($result['errors']) && is_array($result['errors']) && !empty($result['errors'])) {
@@ -550,7 +558,7 @@ function changeBotFightMode($domain) {
     }
 }
 
-function changeAILabyrinth($domain) {
+function changeAILabyrinth($domain, $enabled = '1') {
     global $pdo, $userId;
     
     if (!$domain['zone_id']) {
@@ -575,10 +583,15 @@ function changeAILabyrinth($domain) {
         // Используем первый токен (самый свежий, так как они отсортированы по created_at DESC)
         $apiToken = $tokens[0]['token'];
         
-        logAction($pdo, $userId, "Mass AI Labyrinth Change Attempt", "Domain: {$domain['domain']}, Enabling AI Labyrinth, Using Token: " . substr($apiToken, 0, 10) . '...');
+        // Преобразуем строковое значение в формат API
+        $crawlerProtectionEnabled = ($enabled === '1' || $enabled === 1 || $enabled === true);
+        $crawlerProtectionValue = $crawlerProtectionEnabled ? 'enabled' : 'disabled';
+        $action = $crawlerProtectionEnabled ? 'Enabling' : 'Disabling';
+        
+        logAction($pdo, $userId, "Mass AI Labyrinth Change Attempt", "Domain: {$domain['domain']}, $action AI Labyrinth, Using Token: " . substr($apiToken, 0, 10) . '...');
         
         $url = "https://api.cloudflare.com/client/v4/zones/{$domain['zone_id']}/bot_management";
-        $payload = json_encode(['crawler_protection' => 'enabled']);
+        $payload = json_encode(['crawler_protection' => $crawlerProtectionValue]);
         
         $ch = curl_init($url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -640,14 +653,17 @@ function changeAILabyrinth($domain) {
             $crawlerProtection = $result['result']['crawler_protection'] ?? 'disabled';
             logAction($pdo, $userId, "AI Labyrinth Change Success", "Domain: {$domain['domain']}, Crawler Protection: $crawlerProtection");
             
+            $message = ($crawlerProtection === 'enabled') ? "AI Labyrinth включен" : "AI Labyrinth выключен";
+            
             return [
                 'success' => true,
-                'message' => "AI Labyrinth включен",
+                'message' => $message,
                 'domain_id' => $domain['id'],
                 'result' => $result['result'] ?? null
             ];
         } else {
-            $errorMsg = 'Не удалось включить AI Labyrinth через API';
+            $actionText = $crawlerProtectionEnabled ? 'включить' : 'выключить';
+            $errorMsg = "Не удалось $actionText AI Labyrinth через API";
             $errorDetails = [];
             
             if (isset($result['errors']) && is_array($result['errors']) && !empty($result['errors'])) {
@@ -1108,13 +1124,19 @@ function deleteDomainFromMass($domain) {
                         <h5 class="mb-0"><i class="fas fa-shield-virus me-2"></i>Bot Fight Mode</h5>
                     </div>
                     <div class="card-body">
-                        <div class="alert alert-info mb-3">
-                            <i class="fas fa-info-circle me-1"></i>
-                            <strong>Информация:</strong> Включает защиту от ботов для выбранных доменов.
+                        <div class="row">
+                            <div class="col-md-6">
+                                <select id="botFightMode" class="form-select">
+                                    <option value="1" selected>Включить Bot Fight Mode</option>
+                                    <option value="0">Выключить Bot Fight Mode</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <button class="btn btn-dark w-100" onclick="changeBotFightMode()">
+                                    <i class="fas fa-play me-1"></i>Изменить Bot Fight Mode
+                                </button>
+                            </div>
                         </div>
-                        <button class="btn btn-dark w-100" onclick="changeBotFightMode()">
-                            <i class="fas fa-shield-virus me-1"></i>Включить Bot Fight Mode
-                        </button>
                     </div>
                 </div>
 
@@ -1124,13 +1146,19 @@ function deleteDomainFromMass($domain) {
                         <h5 class="mb-0"><i class="fas fa-robot me-2"></i>AI Labyrinth</h5>
                     </div>
                     <div class="card-body">
-                        <div class="alert alert-info mb-3">
-                            <i class="fas fa-info-circle me-1"></i>
-                            <strong>Информация:</strong> Включает защиту от краулеров (AI Labyrinth) для выбранных доменов.
+                        <div class="row">
+                            <div class="col-md-6">
+                                <select id="aiLabyrinthMode" class="form-select">
+                                    <option value="1" selected>Включить AI Labyrinth</option>
+                                    <option value="0">Выключить AI Labyrinth</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <button class="btn btn-secondary w-100" onclick="changeAILabyrinth()">
+                                    <i class="fas fa-play me-1"></i>Изменить AI Labyrinth
+                                </button>
+                            </div>
                         </div>
-                        <button class="btn btn-secondary w-100" onclick="changeAILabyrinth()">
-                            <i class="fas fa-robot me-1"></i>Включить AI Labyrinth
-                        </button>
                     </div>
                 </div>
 
@@ -1469,11 +1497,13 @@ function deleteDomainFromMass($domain) {
         }
 
         function changeBotFightMode() {
-            performOperation('change_bot_fight_mode', {});
+            const botFightMode = document.getElementById('botFightMode').value;
+            performOperation('change_bot_fight_mode', { enabled: botFightMode });
         }
 
         function changeAILabyrinth() {
-            performOperation('change_ai_labyrinth', {});
+            const aiLabyrinthMode = document.getElementById('aiLabyrinthMode').value;
+            performOperation('change_ai_labyrinth', { enabled: aiLabyrinthMode });
         }
 
         function purgeCache() {
