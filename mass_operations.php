@@ -18,14 +18,17 @@ if (!isset($_SESSION['user_id'])) {
 
 $userId = $_SESSION['user_id'];
 
-// Получаем домены пользователя
+// Получаем домены пользователя с информацией о наличии API токена
 $stmt = $pdo->prepare("
     SELECT ca.id, ca.domain, ca.zone_id, ca.dns_ip, ca.ssl_mode, ca.always_use_https, 
-           ca.min_tls_version, g.name as group_name, cc.email
+           ca.min_tls_version, g.name as group_name, cc.email, ca.account_id,
+           CASE WHEN cat.id IS NOT NULL THEN 1 ELSE 0 END as has_api_token
     FROM cloudflare_accounts ca
     JOIN cloudflare_credentials cc ON ca.account_id = cc.id
     LEFT JOIN groups g ON ca.group_id = g.id
+    LEFT JOIN cloudflare_api_tokens cat ON ca.account_id = cat.account_id AND cat.user_id = ca.user_id
     WHERE ca.user_id = ?
+    GROUP BY ca.id
     ORDER BY ca.domain ASC
 ");
 $stmt->execute([$userId]);
@@ -115,8 +118,20 @@ function performOperation($action, $domainId, $params) {
         case 'change_tls':
             return changeTLS($domain, $params['min_tls_version'] ?? '');
             
+        case 'change_bot_fight_mode':
+            return changeBotFightMode($domain, $params['enabled'] ?? '1');
+            
+        case 'change_ai_labyrinth':
+            return changeAILabyrinth($domain, $params['enabled'] ?? '1');
+            
         case 'delete_domain':
             return deleteDomainFromMass($domain);
+            
+        case 'purge_cache':
+            return purgeCache($domain);
+            
+        case 'configure_caching':
+            return configureCaching($domain);
             
         default:
             return ['success' => false, 'error' => 'Неизвестная операция', 'domain_id' => $domainId];
@@ -396,6 +411,447 @@ function changeTLS($domain, $minTlsVersion) {
     }
 }
 
+function changeBotFightMode($domain, $enabled = '1') {
+    global $pdo, $userId;
+    
+    if (!$domain['zone_id']) {
+        return ['success' => false, 'error' => 'Zone ID не найден', 'domain_id' => $domain['id']];
+    }
+    
+    try {
+        $proxies = getProxies($pdo, $userId);
+        
+        // Получаем API токен для аккаунта
+        $accountId = $domain['account_id'] ?? null;
+        if (!$accountId) {
+            return ['success' => false, 'error' => 'Account ID не найден', 'domain_id' => $domain['id']];
+        }
+        
+        // Получаем первый доступный токен для этого аккаунта
+        $tokens = listCloudflareApiTokens($pdo, $userId, $accountId);
+        if (empty($tokens)) {
+            return ['success' => false, 'error' => 'API токен не найден для этого аккаунта. Добавьте токен в настройках.', 'domain_id' => $domain['id']];
+        }
+        
+        // Используем первый токен (самый свежий, так как они отсортированы по created_at DESC)
+        $apiToken = $tokens[0]['token'];
+        
+        // Преобразуем строковое значение в boolean
+        $fightModeEnabled = ($enabled === '1' || $enabled === 1 || $enabled === true);
+        $action = $fightModeEnabled ? 'Enabling' : 'Disabling';
+        
+        logAction($pdo, $userId, "Mass Bot Fight Mode Change Attempt", "Domain: {$domain['domain']}, $action Bot Fight Mode, Using Token: " . substr($apiToken, 0, 10) . '...');
+        
+        $url = "https://api.cloudflare.com/client/v4/zones/{$domain['zone_id']}/bot_management";
+        $payload = json_encode(['fight_mode' => $fightModeEnabled]);
+        
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PUT');
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
+        
+        // Используем Bearer token для аутентификации
+        $headers = [
+            'Content-Type: application/json',
+            'Content-Length: ' . strlen($payload),
+            'Authorization: Bearer ' . trim($apiToken)
+        ];
+        
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        
+        // Настройка прокси
+        if ($proxies) {
+            $proxy = getRandomProxy($proxies);
+            if ($proxy && preg_match('/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)@([^:@]+):(.+)$/', $proxy, $matches)) {
+                $proxyIp = $matches[1];
+                $proxyPort = $matches[2];
+                $proxyLogin = $matches[3];
+                $proxyPass = $matches[4];
+                
+                curl_setopt($ch, CURLOPT_PROXY, "$proxyIp:$proxyPort");
+                curl_setopt($ch, CURLOPT_PROXYUSERPWD, "$proxyLogin:$proxyPass");
+                curl_setopt($ch, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
+                
+                logAction($pdo, $userId, "Using Proxy (Bot Fight Mode)", "Proxy: $proxyIp:$proxyPort, Domain: {$domain['domain']}");
+            }
+        }
+       
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
+        curl_close($ch);
+        
+        if ($curlError) {
+            logAction($pdo, $userId, "Bot Fight Mode cURL Error", "Domain: {$domain['domain']}, Error: $curlError");
+            return [
+                'success' => false,
+                'error' => 'cURL Error: ' . $curlError,
+                'domain_id' => $domain['id']
+            ];
+        }
+        
+        $result = json_decode($response, true);
+        
+        // Логируем ответ
+        logAction($pdo, $userId, "Bot Fight Mode API Response", 
+            "Domain: {$domain['domain']}, HTTP Code: $httpCode, Success: " . (isset($result['success']) ? ($result['success'] ? 'true' : 'false') : 'unknown') .
+            ", Response: " . substr($response, 0, 500));
+        
+        if ($httpCode === 200 && isset($result['success']) && $result['success']) {
+            $fightMode = $result['result']['fight_mode'] ?? false;
+            $status = $fightMode ? 'enabled' : 'disabled';
+            logAction($pdo, $userId, "Bot Fight Mode Change Success", "Domain: {$domain['domain']}, Bot Fight Mode: $status");
+            
+            $message = $fightMode ? "Bot Fight Mode включен" : "Bot Fight Mode выключен";
+            
+            return [
+                'success' => true,
+                'message' => $message,
+                'domain_id' => $domain['id'],
+                'result' => $result['result'] ?? null
+            ];
+        } else {
+            $actionText = $fightModeEnabled ? 'включить' : 'выключить';
+            $errorMsg = "Не удалось $actionText Bot Fight Mode через API";
+            $errorDetails = [];
+            
+            if (isset($result['errors']) && is_array($result['errors']) && !empty($result['errors'])) {
+                foreach ($result['errors'] as $err) {
+                    if (is_array($err)) {
+                        $errorDetails[] = ($err['message'] ?? '') . ($err['code'] ? ' (code: ' . $err['code'] . ')' : '');
+                    } else {
+                        $errorDetails[] = (string)$err;
+                    }
+                }
+            }
+            
+            if ($httpCode !== 200) {
+                $errorDetails[] = 'HTTP ' . $httpCode;
+            }
+            
+            if (empty($errorDetails)) {
+                $errorDetails[] = 'Неизвестная ошибка API';
+            }
+            
+            $errorMsg .= ': ' . implode(', ', $errorDetails);
+            
+            logAction($pdo, $userId, "Bot Fight Mode Change Failed", "Domain: {$domain['domain']}, Error: $errorMsg");
+            return [
+                'success' => false,
+                'error' => $errorMsg,
+                'domain_id' => $domain['id'],
+                'http_code' => $httpCode
+            ];
+        }
+        
+    } catch (Exception $e) {
+        logAction($pdo, $userId, "Bot Fight Mode Change Exception", "Domain: {$domain['domain']}, Error: " . $e->getMessage());
+        return [
+            'success' => false,
+            'error' => 'Ошибка: ' . $e->getMessage(),
+            'domain_id' => $domain['id']
+        ];
+    }
+}
+
+function changeAILabyrinth($domain, $enabled = '1') {
+    global $pdo, $userId;
+    
+    if (!$domain['zone_id']) {
+        return ['success' => false, 'error' => 'Zone ID не найден', 'domain_id' => $domain['id']];
+    }
+    
+    try {
+        $proxies = getProxies($pdo, $userId);
+        
+        // Получаем API токен для аккаунта
+        $accountId = $domain['account_id'] ?? null;
+        if (!$accountId) {
+            return ['success' => false, 'error' => 'Account ID не найден', 'domain_id' => $domain['id']];
+        }
+        
+        // Получаем первый доступный токен для этого аккаунта
+        $tokens = listCloudflareApiTokens($pdo, $userId, $accountId);
+        if (empty($tokens)) {
+            return ['success' => false, 'error' => 'API токен не найден для этого аккаунта. Добавьте токен в настройках.', 'domain_id' => $domain['id']];
+        }
+        
+        // Используем первый токен (самый свежий, так как они отсортированы по created_at DESC)
+        $apiToken = $tokens[0]['token'];
+        
+        // Преобразуем строковое значение в формат API
+        $crawlerProtectionEnabled = ($enabled === '1' || $enabled === 1 || $enabled === true);
+        $crawlerProtectionValue = $crawlerProtectionEnabled ? 'enabled' : 'disabled';
+        $action = $crawlerProtectionEnabled ? 'Enabling' : 'Disabling';
+        
+        logAction($pdo, $userId, "Mass AI Labyrinth Change Attempt", "Domain: {$domain['domain']}, $action AI Labyrinth, Using Token: " . substr($apiToken, 0, 10) . '...');
+        
+        $url = "https://api.cloudflare.com/client/v4/zones/{$domain['zone_id']}/bot_management";
+        $payload = json_encode(['crawler_protection' => $crawlerProtectionValue]);
+        
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PUT');
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
+        
+        // Используем Bearer token для аутентификации
+        $headers = [
+            'Content-Type: application/json',
+            'Content-Length: ' . strlen($payload),
+            'Authorization: Bearer ' . trim($apiToken)
+        ];
+        
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        
+        // Настройка прокси
+        if ($proxies) {
+            $proxy = getRandomProxy($proxies);
+            if ($proxy && preg_match('/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)@([^:@]+):(.+)$/', $proxy, $matches)) {
+                $proxyIp = $matches[1];
+                $proxyPort = $matches[2];
+                $proxyLogin = $matches[3];
+                $proxyPass = $matches[4];
+                
+                curl_setopt($ch, CURLOPT_PROXY, "$proxyIp:$proxyPort");
+                curl_setopt($ch, CURLOPT_PROXYUSERPWD, "$proxyLogin:$proxyPass");
+                curl_setopt($ch, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
+                
+                logAction($pdo, $userId, "Using Proxy (AI Labyrinth)", "Proxy: $proxyIp:$proxyPort, Domain: {$domain['domain']}");
+            }
+        }
+        
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
+        curl_close($ch);
+        
+        if ($curlError) {
+            logAction($pdo, $userId, "AI Labyrinth cURL Error", "Domain: {$domain['domain']}, Error: $curlError");
+            return [
+                'success' => false,
+                'error' => 'cURL Error: ' . $curlError,
+                'domain_id' => $domain['id']
+            ];
+        }
+        
+        $result = json_decode($response, true);
+        
+        // Логируем ответ
+        logAction($pdo, $userId, "AI Labyrinth API Response", 
+            "Domain: {$domain['domain']}, HTTP Code: $httpCode, Success: " . (isset($result['success']) ? ($result['success'] ? 'true' : 'false') : 'unknown') .
+            ", Response: " . substr($response, 0, 500));
+        
+        if ($httpCode === 200 && isset($result['success']) && $result['success']) {
+            $crawlerProtection = $result['result']['crawler_protection'] ?? 'disabled';
+            logAction($pdo, $userId, "AI Labyrinth Change Success", "Domain: {$domain['domain']}, Crawler Protection: $crawlerProtection");
+            
+            $message = ($crawlerProtection === 'enabled') ? "AI Labyrinth включен" : "AI Labyrinth выключен";
+            
+            return [
+                'success' => true,
+                'message' => $message,
+                'domain_id' => $domain['id'],
+                'result' => $result['result'] ?? null
+            ];
+        } else {
+            $actionText = $crawlerProtectionEnabled ? 'включить' : 'выключить';
+            $errorMsg = "Не удалось $actionText AI Labyrinth через API";
+            $errorDetails = [];
+            
+            if (isset($result['errors']) && is_array($result['errors']) && !empty($result['errors'])) {
+                foreach ($result['errors'] as $err) {
+                    if (is_array($err)) {
+                        $errorDetails[] = ($err['message'] ?? '') . ($err['code'] ? ' (code: ' . $err['code'] . ')' : '');
+                    } else {
+                        $errorDetails[] = (string)$err;
+                    }
+                }
+            }
+            
+            if ($httpCode !== 200) {
+                $errorDetails[] = 'HTTP ' . $httpCode;
+            }
+            
+            if (empty($errorDetails)) {
+                $errorDetails[] = 'Неизвестная ошибка API';
+            }
+            
+            $errorMsg .= ': ' . implode(', ', $errorDetails);
+            
+            logAction($pdo, $userId, "AI Labyrinth Change Failed", "Domain: {$domain['domain']}, Error: $errorMsg");
+            return [
+                'success' => false,
+                'error' => $errorMsg,
+                'domain_id' => $domain['id'],
+                'http_code' => $httpCode
+            ];
+        }
+        
+    } catch (Exception $e) {
+        logAction($pdo, $userId, "AI Labyrinth Change Exception", "Domain: {$domain['domain']}, Error: " . $e->getMessage());
+        return [
+            'success' => false,
+            'error' => 'Ошибка: ' . $e->getMessage(),
+            'domain_id' => $domain['id']
+        ];
+    }
+}
+
+function purgeCache($domain) {
+    global $pdo, $userId;
+    
+    if (!$domain['zone_id']) {
+        return ['success' => false, 'error' => 'Zone ID не найден', 'domain_id' => $domain['id']];
+    }
+    
+    try {
+        $proxies = getProxies($pdo, $userId);
+        $zoneId = $domain['zone_id'];
+        
+        logAction($pdo, $userId, "Mass Cache Purge Attempt", "Domain: {$domain['domain']}, Zone: $zoneId");
+        
+        $payload = ['purge_everything' => true];
+        $purgeResp = cloudflareApiRequestDetailed($pdo, $domain['email'], $domain['api_key'], "zones/$zoneId/purge_cache", 'POST', $payload, $proxies, $userId);
+        
+        if ($purgeResp['success']) {
+            logAction($pdo, $userId, "Mass Cache Purge Success", "Domain: {$domain['domain']}, Zone: $zoneId");
+            
+            return [
+                'success' => true,
+                'message' => "Кеш очищен",
+                'domain_id' => $domain['id'],
+                'zone_id' => $zoneId
+            ];
+        } else {
+            $err = 'Не удалось очистить кеш';
+            if (!empty($purgeResp['api_errors'])) {
+                $err .= ': ' . implode(', ', array_map(fn($e) => ($e['code'] ?? '?') . ' ' . ($e['message'] ?? 'unknown'), $purgeResp['api_errors']));
+            }
+            
+            logAction($pdo, $userId, "Mass Cache Purge Failed", "Domain: {$domain['domain']}, Error: $err");
+            return ['success' => false, 'error' => $err, 'domain_id' => $domain['id']];
+        }
+        
+    } catch (Exception $e) {
+        logAction($pdo, $userId, "Mass Cache Purge Exception", "Domain: {$domain['domain']}, Error: " . $e->getMessage());
+        return ['success' => false, 'error' => 'Ошибка API: ' . $e->getMessage(), 'domain_id' => $domain['id']];
+    }
+}
+
+function configureCaching($domain) {
+    global $pdo, $userId;
+    
+    if (!$domain['zone_id']) {
+        return ['success' => false, 'error' => 'Zone ID не найден', 'domain_id' => $domain['id']];
+    }
+    
+    try {
+        $proxies = getProxies($pdo, $userId);
+        $zoneId = $domain['zone_id'];
+        
+        logAction($pdo, $userId, "Mass Configure Caching Attempt", "Domain: {$domain['domain']}, Zone: $zoneId");
+        
+        // Определяем базовый URL (с протоколом)
+        $baseUrl = $domain['domain'];
+        $domainPattern = "*{$baseUrl}";
+        
+        // Паттерны для правил
+        $patterns = [
+            'assets' => "{$domainPattern}/assets/*",
+            'js' => "{$domainPattern}/js/*",
+            'build' => "{$domainPattern}/build/*"
+        ];
+        
+        // Настройки кеширования
+        $browserCacheTTL = 86400; // 1 день в секундах
+        $edgeCacheTTL = 604800; // 7 дней в секундах
+        
+        $createdRules = [];
+        $failedRules = [];
+        $priority = 1;
+        
+        // Создаем 3 правила для каждого паттерна
+        foreach ($patterns as $name => $pattern) {
+            $rule = [
+                'targets' => [[
+                    'target' => 'url',
+                    'constraint' => [
+                        'operator' => 'matches',
+                        'value' => $pattern
+                    ]
+                ]],
+                'actions' => [
+                    [
+                        'id' => 'browser_cache_ttl',
+                        'value' => $browserCacheTTL
+                    ],
+                    [
+                        'id' => 'cache_level',
+                        'value' => 'cache_everything'
+                    ],
+                    [
+                        'id' => 'edge_cache_ttl',
+                        'value' => $edgeCacheTTL
+                    ]
+                ],
+                'status' => 'active',
+                'priority' => $priority++
+            ];
+            
+            $resp = cloudflareApiRequestDetailed($pdo, $domain['email'], $domain['api_key'], "zones/$zoneId/pagerules", 'POST', $rule, $proxies, $userId);
+            
+            if ($resp['success']) {
+                $createdRules[] = $name;
+                logAction($pdo, $userId, "Mass Configure Caching Rule Created", "Domain: {$domain['domain']}, Pattern: $pattern, Rule: $name");
+            } else {
+                $err = "Не удалось создать правило для $name";
+                if (!empty($resp['api_errors'])) {
+                    $err .= ': ' . implode(', ', array_map(fn($e) => ($e['code'] ?? '?') . ' ' . ($e['message'] ?? 'unknown'), $resp['api_errors']));
+                }
+                $failedRules[] = $err;
+                logAction($pdo, $userId, "Mass Configure Caching Rule Failed", "Domain: {$domain['domain']}, Pattern: $pattern, Error: $err");
+            }
+            
+            // Небольшая задержка между запросами
+            usleep(200000); // 0.2 секунды
+        }
+        
+        if (count($createdRules) > 0) {
+            $message = "Создано правил: " . count($createdRules) . " из " . count($patterns);
+            if (count($failedRules) > 0) {
+                $message .= ". Ошибки: " . implode('; ', $failedRules);
+            }
+            
+            logAction($pdo, $userId, "Mass Configure Caching Success", "Domain: {$domain['domain']}, Created: " . implode(', ', $createdRules));
+            
+            return [
+                'success' => true,
+                'message' => $message,
+                'domain_id' => $domain['id'],
+                'zone_id' => $zoneId,
+                'created_rules' => $createdRules,
+                'failed_rules' => $failedRules
+            ];
+        } else {
+            $err = 'Не удалось создать ни одно правило: ' . implode('; ', $failedRules);
+            logAction($pdo, $userId, "Mass Configure Caching Failed", "Domain: {$domain['domain']}, Error: $err");
+            return ['success' => false, 'error' => $err, 'domain_id' => $domain['id']];
+        }
+        
+    } catch (Exception $e) {
+        logAction($pdo, $userId, "Mass Configure Caching Exception", "Domain: {$domain['domain']}, Error: " . $e->getMessage());
+        return ['success' => false, 'error' => 'Ошибка API: ' . $e->getMessage(), 'domain_id' => $domain['id']];
+    }
+}
+
 function deleteDomainFromMass($domain) {
     global $pdo, $userId;
     
@@ -521,19 +977,39 @@ function deleteDomainFromMass($domain) {
                     </div>
                     <div class="card-body">
                         <div class="mb-3">
+                            <input type="text" id="domainSearch" class="form-control" placeholder="Поиск по домену..." 
+                                   onkeyup="filterDomains()">
+                        </div>
+                        
+                        <div class="mb-3">
+                            <div class="form-check form-switch">
+                                <input class="form-check-input" type="checkbox" id="hasApiTokenFilter" onchange="filterDomains()">
+                                <label class="form-check-label" for="hasApiTokenFilter">
+                                    <i class="fas fa-key me-1"></i>Has API token
+                                </label>
+                            </div>
+                        </div>
+                        
+                        <div class="mb-3">
                             <label class="form-check-label">
                                 <input type="checkbox" id="selectAll" class="form-check-input me-2" onchange="toggleSelectAll()">
                                 Выбрать все домены
                             </label>
                         </div>
                         
-                        <div style="max-height: 400px; overflow-y: auto;">
+                        <div id="domainList" style="max-height: 400px; overflow-y: auto;">
                             <?php foreach ($domains as $domain): ?>
-                                <div class="form-check mb-2">
+                                <div class="form-check mb-2 domain-item" 
+                                     data-domain="<?php echo htmlspecialchars(strtolower($domain['domain'])); ?>"
+                                     data-has-api-token="<?php echo $domain['has_api_token'] ? '1' : '0'; ?>">
                                     <input class="form-check-input domain-checkbox" type="checkbox" 
                                            value="<?php echo $domain['id']; ?>" id="domain-<?php echo $domain['id']; ?>">
                                     <label class="form-check-label" for="domain-<?php echo $domain['id']; ?>">
-                                        <strong><?php echo htmlspecialchars($domain['domain']); ?></strong><br>
+                                        <strong><?php echo htmlspecialchars($domain['domain']); ?></strong>
+                                        <?php if ($domain['has_api_token']): ?>
+                                            <i class="fas fa-key text-success ms-1" title="Has API token"></i>
+                                        <?php endif; ?>
+                                        <br>
                                         <small class="text-muted">
                                             <?php echo htmlspecialchars($domain['group_name'] ?? 'Без группы'); ?>
                                             • IP: <?php echo htmlspecialchars($domain['dns_ip'] ?? 'Не указан'); ?>
@@ -642,6 +1118,87 @@ function deleteDomainFromMass($domain) {
                     </div>
                 </div>
 
+                <!-- Bot Fight Mode -->
+                <div class="card operation-card mb-3">
+                    <div class="card-header bg-dark text-white">
+                        <h5 class="mb-0"><i class="fas fa-shield-virus me-2"></i>Bot Fight Mode</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <select id="botFightMode" class="form-select">
+                                    <option value="1" selected>Включить Bot Fight Mode</option>
+                                    <option value="0">Выключить Bot Fight Mode</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <button class="btn btn-dark w-100" onclick="changeBotFightMode()">
+                                    <i class="fas fa-play me-1"></i>Изменить Bot Fight Mode
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- AI Labyrinth -->
+                <div class="card operation-card mb-3">
+                    <div class="card-header bg-secondary text-white">
+                        <h5 class="mb-0"><i class="fas fa-robot me-2"></i>AI Labyrinth</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <select id="aiLabyrinthMode" class="form-select">
+                                    <option value="1" selected>Включить AI Labyrinth</option>
+                                    <option value="0">Выключить AI Labyrinth</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <button class="btn btn-secondary w-100" onclick="changeAILabyrinth()">
+                                    <i class="fas fa-play me-1"></i>Изменить AI Labyrinth
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Очистка кеша -->
+                <div class="card operation-card mb-3">
+                    <div class="card-header bg-purple text-white" style="background-color: #6f42c1 !important;">
+                        <h5 class="mb-0"><i class="fas fa-broom me-2"></i>Очистка кеша</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="alert alert-info mb-3">
+                            <i class="fas fa-info-circle me-1"></i>
+                            <strong>Информация:</strong> Очищает весь кеш Cloudflare для выбранных доменов.
+                        </div>
+                        <button class="btn w-100" onclick="purgeCache()" style="background-color: #6f42c1; color: white;">
+                            <i class="fas fa-broom me-1"></i>Очистить кеш
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Настройка кеширования -->
+                <div class="card operation-card mb-3">
+                    <div class="card-header text-white" style="background-color: #17a2b8 !important;">
+                        <h5 class="mb-0"><i class="fas fa-cog me-2"></i>Настроить кеширование</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="alert alert-info mb-3">
+                            <i class="fas fa-info-circle me-1"></i>
+                            <strong>Информация:</strong> Создает 3 правила кеширования для каждого домена:
+                            <ul class="mb-0 mt-2">
+                                <li><code>/assets/*</code> - Browser Cache: 1 день, Cache Level: Cache Everything, Edge Cache: 7 дней</li>
+                                <li><code>/js/*</code> - Browser Cache: 1 день, Cache Level: Cache Everything, Edge Cache: 7 дней</li>
+                                <li><code>/build/*</code> - Browser Cache: 1 день, Cache Level: Cache Everything, Edge Cache: 7 дней</li>
+                            </ul>
+                        </div>
+                        <button class="btn w-100" onclick="configureCaching()" style="background-color: #17a2b8; color: white;">
+                            <i class="fas fa-cog me-1"></i>Настроить кеширование
+                        </button>
+                    </div>
+                </div>
+
                 <!-- Удаление доменов -->
                 <div class="card operation-card mb-3">
                     <div class="card-header bg-danger text-white">
@@ -698,7 +1255,7 @@ function deleteDomainFromMass($domain) {
         // Управление выбором доменов
         function toggleSelectAll() {
             const selectAll = document.getElementById('selectAll');
-            const checkboxes = document.querySelectorAll('.domain-checkbox');
+            const checkboxes = document.querySelectorAll('.domain-checkbox:not([style*="display: none"])');
             
             checkboxes.forEach(checkbox => {
                 checkbox.checked = selectAll.checked;
@@ -706,10 +1263,62 @@ function deleteDomainFromMass($domain) {
             
             updateSelectedCount();
         }
+        
+        // Обновляем счетчик при изменении фильтров
+        document.getElementById('hasApiTokenFilter').addEventListener('change', function() {
+            updateSelectedCount();
+        });
 
         function updateSelectedCount() {
             const checked = document.querySelectorAll('.domain-checkbox:checked').length;
             document.getElementById('selectedCount').textContent = checked;
+        }
+
+        // Фильтрация доменов по поисковому запросу и API token
+        function filterDomains() {
+            const searchTerm = document.getElementById('domainSearch').value.toLowerCase().trim();
+            const hasApiTokenFilter = document.getElementById('hasApiTokenFilter').checked;
+            const domainItems = document.querySelectorAll('.domain-item');
+            let visibleCount = 0;
+            
+            domainItems.forEach(item => {
+                const domainName = item.getAttribute('data-domain');
+                const hasApiToken = item.getAttribute('data-has-api-token') === '1';
+                
+                // Проверка поискового запроса
+                const matchesSearch = searchTerm === '' || domainName.includes(searchTerm);
+                
+                // Проверка фильтра API token
+                const matchesApiTokenFilter = !hasApiTokenFilter || hasApiToken;
+                
+                if (matchesSearch && matchesApiTokenFilter) {
+                    item.style.display = '';
+                    visibleCount++;
+                } else {
+                    item.style.display = 'none';
+                }
+            });
+            
+            // Обновляем счетчик выбранных доменов
+            updateSelectedCount();
+            
+            // Показываем сообщение если ничего не найдено
+            const domainList = document.getElementById('domainList');
+            let noResultsMsg = document.getElementById('noResultsMessage');
+            
+            if (visibleCount === 0 && (searchTerm !== '' || hasApiTokenFilter)) {
+                if (!noResultsMsg) {
+                    noResultsMsg = document.createElement('div');
+                    noResultsMsg.id = 'noResultsMessage';
+                    noResultsMsg.className = 'alert alert-info mt-3';
+                    noResultsMsg.innerHTML = '<i class="fas fa-info-circle me-1"></i>Домены не найдены';
+                    domainList.appendChild(noResultsMsg);
+                }
+            } else {
+                if (noResultsMsg) {
+                    noResultsMsg.remove();
+                }
+            }
         }
 
         // Обновляем счетчик при изменении чекбоксов
@@ -885,6 +1494,46 @@ function deleteDomainFromMass($domain) {
         function changeTLS() {
             const tlsVersion = document.getElementById('tlsVersion').value;
             performOperation('change_tls', { min_tls_version: tlsVersion });
+        }
+
+        function changeBotFightMode() {
+            const botFightMode = document.getElementById('botFightMode').value;
+            performOperation('change_bot_fight_mode', { enabled: botFightMode });
+        }
+
+        function changeAILabyrinth() {
+            const aiLabyrinthMode = document.getElementById('aiLabyrinthMode').value;
+            performOperation('change_ai_labyrinth', { enabled: aiLabyrinthMode });
+        }
+
+        function purgeCache() {
+            const domains = getSelectedDomains();
+            
+            if (domains.length === 0) {
+                showNotification('Выберите домены для очистки кеша', 'error');
+                return;
+            }
+
+            if (!confirm(`Очистить кеш для ${domains.length} выбранных доменов?`)) {
+                return;
+            }
+
+            performOperation('purge_cache', {});
+        }
+
+        function configureCaching() {
+            const domains = getSelectedDomains();
+            
+            if (domains.length === 0) {
+                showNotification('Выберите домены для настройки кеширования', 'error');
+                return;
+            }
+
+            if (!confirm(`Настроить кеширование для ${domains.length} выбранных доменов?\n\nБудут созданы 3 правила для каждого домена:\n- /assets/*\n- /js/*\n- /build/*`)) {
+                return;
+            }
+
+            performOperation('configure_caching', {});
         }
 
         function deleteSelectedDomains() {

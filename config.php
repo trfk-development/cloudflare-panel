@@ -10,9 +10,33 @@ define('BASE_PATH', $basePath);
 define('ROOT_PATH', dirname(__FILE__) . '/');
 define('DB_PATH', ROOT_PATH . 'cloudflare_panel.db');
 
-// Перенаправление на HTTPS, если соединение не защищено (исключая localhost, CLI и API файлы)
+// Перенаправление на HTTPS, если соединение не защищено (исключая localhost, Docker, CLI и API файлы)
 if (php_sapi_name() !== 'cli') {
-    $isLocalhost = in_array($_SERVER['HTTP_HOST'], ['localhost', '127.0.0.1', '::1']);
+    // Определяем, находимся ли мы в локальной/разработческой среде
+    $httpHost = $_SERVER['HTTP_HOST'] ?? '';
+    $serverPort = $_SERVER['SERVER_PORT'] ?? '';
+    $serverName = $_SERVER['SERVER_NAME'] ?? '';
+    
+    // Проверяем localhost по различным вариантам
+    $isLocalhost = (
+        in_array($httpHost, ['localhost', '127.0.0.1', '::1']) ||
+        strpos($httpHost, 'localhost:') === 0 ||
+        strpos($httpHost, '127.0.0.1:') === 0 ||
+        in_array($serverName, ['localhost', '127.0.0.1', '::1'])
+    );
+    
+    // Проверяем, используем ли мы стандартные порты разработки (Docker обычно использует 8080)
+    $isDevelopmentPort = in_array($serverPort, ['80', '8080', '8000', '3000', '5000']);
+    
+    // Проверяем, находимся ли мы в Docker (по переменным окружения или по порту)
+    $isDocker = (
+        $isDevelopmentPort ||
+        isset($_SERVER['DOCKER_CONTAINER']) ||
+        file_exists('/.dockerenv') ||
+        getenv('DOCKER_CONTAINER') !== false
+    );
+    
+    // Исключаем API файлы из редиректа
     $isApiFile = (
         isset($_SERVER['REQUEST_URI']) && 
         (strpos($_SERVER['REQUEST_URI'], 'queue_processor.php') !== false ||
@@ -21,7 +45,8 @@ if (php_sapi_name() !== 'cli') {
          strpos($_SERVER['REQUEST_URI'], '.json') !== false)
     );
     
-    if (!$isLocalhost && !$isApiFile && (!isset($_SERVER['HTTPS']) || $_SERVER['HTTPS'] !== 'on')) {
+    // Принудительно перенаправляем на HTTPS только в продакшене (не localhost, не Docker, не API)
+    if (!$isLocalhost && !$isDocker && !$isApiFile && (!isset($_SERVER['HTTPS']) || $_SERVER['HTTPS'] !== 'on')) {
         header("Location: https://" . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI']);
         exit;
     }
@@ -34,15 +59,15 @@ try {
     // Проверяем права доступа к файлу базы данных
     if (!file_exists(DB_PATH)) {
         touch(DB_PATH);
-        chmod(DB_PATH, 0600); // Устанавливаем права 600 (только владелец может читать/писать) для безопасности
+        chmod(DB_PATH, 0660); // Устанавливаем права 660 (владелец и группа могут читать/писать) для безопасности
     } elseif (!is_writable(DB_PATH)) {
         die("Database file is not writable: " . DB_PATH);
     }
     
     // Проверяем и исправляем права доступа, если они слишком широкие
     $currentPerms = fileperms(DB_PATH) & 0777;
-    if ($currentPerms > 0600) {
-        chmod(DB_PATH, 0600);
+    if ($currentPerms > 0660) {
+        chmod(DB_PATH, 0660);
     }
 
     // Создаем соединение с базой данных

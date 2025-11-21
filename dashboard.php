@@ -1,7 +1,8 @@
 <?php
-require_once 'header.php';
+require_once 'config.php';
 require_once 'functions.php';
 require_once 'handle_forms.php';
+require_once 'header.php';
 
 if (!isset($_SESSION['user_id'])) {
     header('Location: ' . BASE_PATH . 'login.php');
@@ -337,8 +338,11 @@ function formatNameservers($nsRecords) {
 
     <!-- Основная таблица -->
     <div class="card">
-        <div class="card-header">
+        <div class="card-header d-flex justify-content-between align-items-center">
             <h5 class="card-title mb-0">Домены (<?php echo $totalDomains; ?>)</h5>
+            <button class="btn btn-outline-info btn-sm" onclick="openAddTokenModal()" title="Добавить API токен">
+                <i class="fas fa-key me-1"></i>Добавить API токен
+            </button>
         </div>
         
         <div class="card-body">
@@ -663,6 +667,61 @@ function formatNameservers($nsRecords) {
     </div>
 </div>
 
+<!-- Модальное окно для добавления API токена -->
+<div class="modal fade" id="addTokenModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">
+                    <i class="fas fa-key me-2"></i>Добавить API токен
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div id="tokenModalStatus" class="mb-3"></div>
+                
+                <form id="addTokenForm">
+                    <div class="mb-3">
+                        <label for="tokenAccount" class="form-label">Аккаунт <span class="text-danger">*</span></label>
+                        <select class="form-select" id="tokenAccount" required>
+                            <option value="">— Выберите аккаунт —</option>
+                            <?php foreach ($accounts as $account): ?>
+                                <option value="<?php echo $account['id']; ?>">
+                                    <?php echo htmlspecialchars($account['email'] ?? 'Аккаунт #' . $account['id']); ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="tokenName" class="form-label">Название токена <span class="text-danger">*</span></label>
+                        <input type="text" class="form-control" id="tokenName" placeholder="Например: Production API Token" required>
+                        <div class="form-text">Укажите понятное название для идентификации токена</div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="tokenValue" class="form-label">API токен <span class="text-danger">*</span></label>
+                        <input type="text" class="form-control" id="tokenValue" placeholder="Вставьте токен из Cloudflare" required>
+                        <div class="form-text">Скопируйте токен из панели Cloudflare</div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="tokenTag" class="form-label">Тег (необязательно)</label>
+                        <input type="text" class="form-control" id="tokenTag" placeholder="Например: production, staging">
+                        <div class="form-text">Дополнительный тег для категоризации</div>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Отмена</button>
+                <button type="button" class="btn btn-primary" onclick="saveApiToken()">
+                    <i class="fas fa-save me-1"></i>Сохранить токен
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script>
 // Глобальные переменные
@@ -670,6 +729,7 @@ let operationModal = null;
 let currentOperation = null;
 let workerModalInstance = null;
 let bulkWorkerModalInstance = null;
+let tokenModalInstance = null;
 let workerCurrentDomainId = null;
 let workerCurrentDomainName = '';
 let workerTemplatesCache = [];
@@ -683,6 +743,10 @@ document.addEventListener('DOMContentLoaded', function() {
     const bulkWorkerModalEl = document.getElementById('bulkWorkerModal');
     if (bulkWorkerModalEl) {
         bulkWorkerModalInstance = new bootstrap.Modal(bulkWorkerModalEl);
+    }
+    const tokenModalEl = document.getElementById('addTokenModal');
+    if (tokenModalEl) {
+        tokenModalInstance = new bootstrap.Modal(tokenModalEl);
     }
 
     const saveTemplateCheckbox = document.getElementById('workerSaveTemplate');
@@ -2111,6 +2175,92 @@ async function deleteDnsRecordPrompt(domainId) {
         const result = await resp.json();
         if (result.success) showNotification('DNS запись удалена', 'success'); else showNotification(result.error || 'Ошибка', 'error');
     } catch (e) { showNotification('Сбой сети: ' + e.message, 'error'); }
+}
+
+// Функции для работы с API токенами
+function openAddTokenModal() {
+    if (!tokenModalInstance) {
+        const tokenModalEl = document.getElementById('addTokenModal');
+        if (tokenModalEl) {
+            tokenModalInstance = new bootstrap.Modal(tokenModalEl);
+        } else {
+            showNotification('Модальное окно не найдено', 'error');
+            return;
+        }
+    }
+    
+    // Очищаем форму
+    document.getElementById('addTokenForm').reset();
+    document.getElementById('tokenModalStatus').innerHTML = '';
+    
+    // Показываем модальное окно
+    tokenModalInstance.show();
+}
+
+async function saveApiToken() {
+    const accountId = document.getElementById('tokenAccount').value;
+    const name = document.getElementById('tokenName').value.trim();
+    const token = document.getElementById('tokenValue').value.trim();
+    const tag = document.getElementById('tokenTag').value.trim();
+    const statusEl = document.getElementById('tokenModalStatus');
+    
+    // Валидация
+    if (!accountId) {
+        statusEl.innerHTML = '<div class="alert alert-danger"><i class="fas fa-exclamation-circle me-1"></i>Выберите аккаунт</div>';
+        return;
+    }
+    
+    if (!name) {
+        statusEl.innerHTML = '<div class="alert alert-danger"><i class="fas fa-exclamation-circle me-1"></i>Укажите название токена</div>';
+        return;
+    }
+    
+    if (!token) {
+        statusEl.innerHTML = '<div class="alert alert-danger"><i class="fas fa-exclamation-circle me-1"></i>Введите API токен</div>';
+        return;
+    }
+    
+    // Показываем загрузку
+    statusEl.innerHTML = '<div class="alert alert-info"><i class="fas fa-spinner fa-spin me-1"></i>Сохранение токена...</div>';
+    
+    try {
+        const response = await fetch('tokens_api.php', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                action: 'create',
+                account_id: parseInt(accountId, 10),
+                name: name,
+                token: token,
+                tag: tag || null
+            })
+        });
+        
+        const result = await response.json();
+        
+        if (result.success) {
+            statusEl.innerHTML = '<div class="alert alert-success"><i class="fas fa-check-circle me-1"></i>Токен успешно сохранен!</div>';
+            showNotification('API токен успешно добавлен', 'success');
+            
+            // Очищаем форму
+            document.getElementById('addTokenForm').reset();
+            
+            // Закрываем модальное окно через 1.5 секунды
+            setTimeout(() => {
+                if (tokenModalInstance) {
+                    tokenModalInstance.hide();
+                }
+            }, 1500);
+        } else {
+            statusEl.innerHTML = `<div class="alert alert-danger"><i class="fas fa-exclamation-circle me-1"></i>Ошибка: ${result.error || 'Неизвестная ошибка'}</div>`;
+            showNotification('Ошибка сохранения токена: ' + (result.error || 'Неизвестная ошибка'), 'error');
+        }
+    } catch (error) {
+        statusEl.innerHTML = `<div class="alert alert-danger"><i class="fas fa-exclamation-circle me-1"></i>Ошибка сети: ${error.message}</div>`;
+        showNotification('Ошибка сети: ' + error.message, 'error');
+    }
 }
 </script>
 
